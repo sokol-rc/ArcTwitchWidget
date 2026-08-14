@@ -200,10 +200,8 @@ dependencies = [
  "arc-live-core",
  "chrono",
  "crossbeam-channel",
- "reqwest 0.13.4",
  "serde",
  "serde_json",
- "zeroize",
 ]
 
 [[package]]

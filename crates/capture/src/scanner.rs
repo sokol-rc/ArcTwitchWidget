@@ -1,7 +1,6 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs;
 use std::io::{Read, Seek, SeekFrom};
-use std::net::{IpAddr, ToSocketAddrs};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -9,7 +8,7 @@ use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
-use arc_live_core::redaction::{fingerprint, json_shape};
+use arc_live_core::redaction::json_shape;
 use compact_str::CompactString;
 use crossbeam_channel::{Receiver, Sender, bounded};
 use pcapsql_core::protocol::{FieldValue, OwnedFieldValue};
@@ -34,12 +33,6 @@ const MAX_KEYLOG_WINDOW: u64 = 4 * 1024 * 1024;
 const MAX_CLIENT_RANDOMS: usize = 2_048;
 type StreamBuffers = Arc<Mutex<HashMap<(u64, Direction), Vec<u8>>>>;
 type PendingRequests = Arc<Mutex<HashMap<u64, VecDeque<(String, String)>>>>;
-const EMBARK_HOSTS: &[&str] = &[
-    "api-gateway.europe.es-pio.net",
-    "client2pubsub.europe.es-pio.net",
-    "client2pubsub-ipv4.europe.es-pio.net",
-];
-
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct CaptureStats {
@@ -60,9 +53,9 @@ pub struct CaptureStats {
     pub tls_decrypt_errors: u64,
     pub last_tls_sni: Option<String>,
     pub last_embark_sni: Option<String>,
+    pub regional_api_hosts: Vec<String>,
     pub decrypted_records: u64,
     pub observations: u64,
-    pub tokens_seen: u64,
     pub active_connections: usize,
     pub buffered_bytes: usize,
     pub connections_evicted: u64,
@@ -75,13 +68,14 @@ pub enum CaptureEvent {
     Status(String),
     Stats(Box<CaptureStats>),
     Observation(Value),
-    Token {
-        token: String,
-        fingerprint: String,
+    StatsStreamReady {
+        host: String,
     },
-    StatsRequestTemplate {
-        headers: Vec<(String, String)>,
-        body: Vec<u8>,
+    PlayerStatsResponse {
+        host: String,
+        status: u16,
+        content_type: Option<String>,
+        body: Value,
     },
     Error(String),
     Stopped,
@@ -156,10 +150,8 @@ fn capture_loop(
     let mut last_key_check = Instant::now();
     let mut last_stats = Instant::now();
     let mut last_cleanup = Instant::now();
-    let mut last_dns_refresh = Instant::now();
-    let mut token_fingerprints = HashSet::new();
     let mut client_randoms = VecDeque::new();
-    let mut embark_ips = resolve_embark_ips();
+    let mut embark_ips = HashSet::new();
 
     while !stop.load(Ordering::Relaxed) {
         if let Some(packet) = capture.next_packet()? {
@@ -173,18 +165,28 @@ fn capture_loop(
                 if segment.src_port == 443 {
                     stats.tcp_443_to_client += 1;
                 }
+                if segment.dst_port == 443
+                    && let Some(sni) = tls_client_hello_sni(&segment.payload)
+                {
+                    stats.last_tls_sni = Some(sni.clone());
+                    if looks_like_regional_api_host(&sni)
+                        && !stats.regional_api_hosts.contains(&sni)
+                    {
+                        if stats.regional_api_hosts.len() >= 16 {
+                            stats.regional_api_hosts.remove(0);
+                        }
+                        stats.regional_api_hosts.push(sni.clone());
+                    }
+                    if is_allowed_host(&sni) {
+                        stats.last_embark_sni = Some(sni);
+                        embark_ips.insert(segment.dst_ip);
+                    }
+                }
                 if embark_ips.is_empty()
                     || embark_ips.contains(&segment.src_ip)
                     || embark_ips.contains(&segment.dst_ip)
                 {
-                    process_segment(
-                        &mut manager,
-                        &segment,
-                        &mut stats,
-                        tx,
-                        &mut token_fingerprints,
-                        &mut client_randoms,
-                    );
+                    process_segment(&mut manager, &segment, &mut stats, tx, &mut client_randoms);
                 }
             }
         } else {
@@ -219,11 +221,6 @@ fn capture_loop(
             last_cleanup = Instant::now();
         }
 
-        if last_dns_refresh.elapsed() >= Duration::from_secs(300) {
-            embark_ips.extend(resolve_embark_ips());
-            last_dns_refresh = Instant::now();
-        }
-
         if last_stats.elapsed() >= Duration::from_secs(1) {
             stats.active_connections = manager.connections().count();
             stats.buffered_bytes = manager.total_memory();
@@ -233,14 +230,6 @@ fn capture_loop(
         }
     }
     Ok(())
-}
-
-fn resolve_embark_ips() -> HashSet<IpAddr> {
-    EMBARK_HOSTS
-        .iter()
-        .flat_map(|host| (*host, 443).to_socket_addrs().into_iter().flatten())
-        .map(|address| address.ip())
-        .collect()
 }
 
 fn build_manager(keylog: KeyLog) -> StreamManager {
@@ -259,7 +248,6 @@ fn process_segment(
     segment: &TcpSegment,
     stats: &mut CaptureStats,
     tx: &Sender<CaptureEvent>,
-    seen_tokens: &mut HashSet<String>,
     client_randoms: &mut VecDeque<[u8; 32]>,
 ) {
     let messages = manager.process_segment(
@@ -326,32 +314,26 @@ fn process_segment(
         }
         if message.protocol == "arc_discovery" {
             let kind = string_field(&message, "kind").unwrap_or_default();
-            if kind == "token" {
-                if let Some(token) = string_field(&message, "token") {
-                    let fp = fingerprint(&token);
-                    if seen_tokens.len() >= 64 && !seen_tokens.contains(&fp) {
-                        seen_tokens.clear();
-                    }
-                    if seen_tokens.insert(fp.clone()) {
-                        stats.tokens_seen += 1;
-                        tx.try_send(CaptureEvent::Token {
-                            token,
-                            fingerprint: fp,
-                        })
-                        .ok();
-                    }
-                }
+            if kind == "stats_stream_ready" {
+                let host = string_field(&message, "host").unwrap_or_default();
+                tx.try_send(CaptureEvent::StatsStreamReady { host }).ok();
                 continue;
             }
-            if kind == "stats_request_template" {
-                let headers = string_field(&message, "request_headers")
+            if kind == "player_stats_response" {
+                let host = string_field(&message, "host").unwrap_or_default();
+                let status = u64_field(&message, "status").unwrap_or(200) as u16;
+                let content_type = string_field(&message, "content_type");
+                if let Some(body) = string_field(&message, "stats_body")
                     .and_then(|value| serde_json::from_str(&value).ok())
-                    .unwrap_or_default();
-                let body = string_field(&message, "request_body")
-                    .map(String::into_bytes)
-                    .unwrap_or_default();
-                tx.try_send(CaptureEvent::StatsRequestTemplate { headers, body })
+                {
+                    tx.try_send(CaptureEvent::PlayerStatsResponse {
+                        host,
+                        status,
+                        content_type,
+                        body,
+                    })
                     .ok();
+                }
                 continue;
             }
             let host = string_field(&message, "host").unwrap_or_default();
@@ -593,50 +575,48 @@ impl StreamParser for DiscoveryParser {
                 method = Some(request_method);
                 path = Some(request_path);
             }
-            if let Some(token) = headers.get("authorization").and_then(|v| bearer(v)) {
+            let is_player_stats = method.as_deref() == Some("POST")
+                && path.as_deref().is_some_and(|value| {
+                    value.split('?').next() == Some("/v1/pioneer/stats/player-v2")
+                });
+            if status.is_none() && is_player_stats {
                 messages.push(discovery_message(
                     context,
-                    "token",
+                    "stats_stream_ready",
                     &host,
                     method.as_deref(),
                     path.as_deref(),
                     status,
                     headers.get("content-type").map(String::as_str),
                     Value::Null,
-                    Some(token),
-                    None,
                     None,
                 ));
             }
-            if status.is_none()
-                && method.as_deref() == Some("POST")
-                && path.as_deref().is_some_and(|value| {
-                    value.split('?').next() == Some("/v1/pioneer/stats/player-v2")
-                })
-            {
-                let replay_headers = replayable_headers(&headers);
-                if let Ok(serialized_headers) = serde_json::to_string(&replay_headers) {
-                    messages.push(discovery_message(
-                        context,
-                        "stats_request_template",
-                        &host,
-                        method.as_deref(),
-                        path.as_deref(),
-                        status,
-                        headers.get("content-type").map(String::as_str),
-                        Value::Null,
-                        None,
-                        Some(&serialized_headers),
-                        std::str::from_utf8(&body).ok(),
-                    ));
-                }
-            }
             let decoded_body = decode_content(&body, headers.get("content-encoding"));
-            let shape = decoded_body
+            let decoded_json = decoded_body
                 .as_deref()
-                .and_then(|body| serde_json::from_slice::<Value>(body).ok())
-                .map(|value| json_shape(&value, 0))
+                .and_then(|body| serde_json::from_slice::<Value>(body).ok());
+            let shape = decoded_json
+                .as_ref()
+                .map(|value| json_shape(value, 0))
                 .unwrap_or(Value::Null);
+            if status.is_some_and(|value| (200..300).contains(&value))
+                && is_player_stats
+                && let Some(stats) = decoded_json.as_ref()
+            {
+                let serialized = stats.to_string();
+                messages.push(discovery_message(
+                    context,
+                    "player_stats_response",
+                    &host,
+                    method.as_deref(),
+                    path.as_deref(),
+                    status,
+                    headers.get("content-type").map(String::as_str),
+                    Value::Null,
+                    Some(&serialized),
+                ));
+            }
             messages.push(discovery_message(
                 context,
                 "observation",
@@ -646,8 +626,6 @@ impl StreamParser for DiscoveryParser {
                 status,
                 headers.get("content-type").map(String::as_str),
                 shape,
-                None,
-                None,
                 None,
             ));
         }
@@ -666,9 +644,7 @@ impl StreamParser for DiscoveryParser {
             FieldDescriptor::new("status", DataKind::UInt64).set_nullable(true),
             FieldDescriptor::new("content_type", DataKind::String).set_nullable(true),
             FieldDescriptor::new("body_shape", DataKind::String).set_nullable(true),
-            FieldDescriptor::new("token", DataKind::String).set_nullable(true),
-            FieldDescriptor::new("request_headers", DataKind::String).set_nullable(true),
-            FieldDescriptor::new("request_body", DataKind::String).set_nullable(true),
+            FieldDescriptor::new("stats_body", DataKind::String).set_nullable(true),
         ]
     }
 }
@@ -683,9 +659,7 @@ fn discovery_message(
     status: Option<u64>,
     content_type: Option<&str>,
     shape: Value,
-    token: Option<String>,
-    request_headers: Option<&str>,
-    request_body: Option<&str>,
+    stats_body: Option<&str>,
 ) -> ParsedMessage {
     let mut fields = HashMap::new();
     put(&mut fields, "kind", kind);
@@ -706,14 +680,8 @@ fn discovery_message(
     if !shape.is_null() {
         put(&mut fields, "body_shape", &shape.to_string());
     }
-    if let Some(value) = token {
-        put(&mut fields, "token", &value);
-    }
-    if let Some(value) = request_headers {
-        put(&mut fields, "request_headers", value);
-    }
-    if let Some(value) = request_body {
-        put(&mut fields, "request_body", value);
+    if let Some(value) = stats_body {
+        put(&mut fields, "stats_body", value);
     }
     ParsedMessage {
         protocol: "arc_discovery",
@@ -723,27 +691,6 @@ fn discovery_message(
         frame_number: 0,
         fields,
     }
-}
-
-fn replayable_headers(headers: &HashMap<String, String>) -> Vec<(String, String)> {
-    const EXCLUDED: &[&str] = &[
-        "authorization",
-        "connection",
-        "content-length",
-        "expect",
-        "host",
-        "proxy-authorization",
-        "te",
-        "trailer",
-        "transfer-encoding",
-        "upgrade",
-        "accept-encoding",
-    ];
-    headers
-        .iter()
-        .filter(|(name, _)| !EXCLUDED.contains(&name.as_str()))
-        .map(|(name, value)| (name.clone(), value.clone()))
-        .collect()
 }
 
 fn put(fields: &mut HashMap<&'static str, OwnedFieldValue>, key: &'static str, value: &str) {
@@ -767,22 +714,103 @@ fn parse_start_line(line: &str) -> (Option<String>, Option<String>, Option<u64>)
     }
 }
 
-fn bearer(value: &str) -> Option<String> {
-    let (scheme, token) = value.split_once(' ')?;
-    (scheme.eq_ignore_ascii_case("bearer") && token.matches('.').count() == 2)
-        .then(|| token.trim().to_owned())
+fn is_allowed_host(host: &str) -> bool {
+    let Some(normalized) = normalize_host(host) else {
+        return false;
+    };
+    let labels: Vec<_> = normalized.split('.').collect();
+    labels.len() >= 4
+        && matches!(
+            labels.first().copied(),
+            Some("api-gateway" | "client2pubsub" | "client2pubsub-ipv4")
+        )
+        && labels[labels.len() - 2..] == ["es-pio", "net"]
 }
 
-fn is_allowed_host(host: &str) -> bool {
+fn looks_like_regional_api_host(host: &str) -> bool {
+    normalize_host(host).is_some_and(|host| {
+        host.starts_with("api-gateway.")
+            || host.ends_with(".es-pio.net")
+            || host.contains("arc-raiders")
+    })
+}
+
+fn normalize_host(host: &str) -> Option<String> {
     let normalized = host
         .trim()
         .trim_end_matches('.')
         .split(':')
-        .next()
-        .unwrap_or(host);
-    EMBARK_HOSTS
-        .iter()
-        .any(|known| normalized.eq_ignore_ascii_case(known))
+        .next()?
+        .to_ascii_lowercase();
+    (!normalized.is_empty()
+        && normalized
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-')))
+    .then_some(normalized)
+}
+
+fn tls_client_hello_sni(payload: &[u8]) -> Option<String> {
+    if payload.len() < 9 || payload[0] != 22 || payload[1] != 3 {
+        return None;
+    }
+    let record_len = u16::from_be_bytes([payload[3], payload[4]]) as usize;
+    let record = payload.get(5..5usize.checked_add(record_len)?)?;
+    if record.len() < 4 || record[0] != 1 {
+        return None;
+    }
+    let handshake_len =
+        ((record[1] as usize) << 16) | ((record[2] as usize) << 8) | record[3] as usize;
+    let hello = record.get(4..4usize.checked_add(handshake_len)?)?;
+    let mut cursor = 2usize.checked_add(32)?;
+
+    let session_len = *hello.get(cursor)? as usize;
+    cursor = cursor.checked_add(1 + session_len)?;
+    let cipher_len = read_u16(hello, cursor)? as usize;
+    cursor = cursor.checked_add(2 + cipher_len)?;
+    let compression_len = *hello.get(cursor)? as usize;
+    cursor = cursor.checked_add(1 + compression_len)?;
+    let extensions_len = read_u16(hello, cursor)? as usize;
+    cursor = cursor.checked_add(2)?;
+    let extensions_end = cursor.checked_add(extensions_len)?.min(hello.len());
+
+    while cursor.checked_add(4)? <= extensions_end {
+        let extension_type = read_u16(hello, cursor)?;
+        let extension_len = read_u16(hello, cursor + 2)? as usize;
+        cursor += 4;
+        let extension_end = cursor.checked_add(extension_len)?;
+        if extension_end > extensions_end {
+            return None;
+        }
+        if extension_type == 0 {
+            let list_len = read_u16(hello, cursor)? as usize;
+            let mut name_cursor = cursor.checked_add(2)?;
+            let list_end = name_cursor.checked_add(list_len)?.min(extension_end);
+            while name_cursor.checked_add(3)? <= list_end {
+                let name_type = *hello.get(name_cursor)?;
+                let name_len = read_u16(hello, name_cursor + 1)? as usize;
+                name_cursor += 3;
+                let name_end = name_cursor.checked_add(name_len)?;
+                if name_end > list_end {
+                    return None;
+                }
+                if name_type == 0 {
+                    return std::str::from_utf8(&hello[name_cursor..name_end])
+                        .ok()
+                        .and_then(normalize_host);
+                }
+                name_cursor = name_end;
+            }
+        }
+        cursor = extension_end;
+    }
+    None
+}
+
+fn read_u16(bytes: &[u8], offset: usize) -> Option<u16> {
+    Some(u16::from_be_bytes([
+        *bytes.get(offset)?,
+        *bytes.get(offset.checked_add(1)?)?,
+    ]))
 }
 
 fn sanitize_path(path: &str) -> String {
@@ -871,7 +899,114 @@ mod tests {
     #[test]
     fn allowlist_rejects_suffix_tricks() {
         assert!(is_allowed_host("api-gateway.europe.es-pio.net:443"));
+        assert!(is_allowed_host("api-gateway.asia.es-pio.net"));
+        assert!(is_allowed_host("client2pubsub.any-region.es-pio.net"));
         assert!(!is_allowed_host("api-gateway.europe.es-pio.net.evil.test"));
+        assert!(!is_allowed_host("evil.es-pio.net"));
+        assert!(looks_like_regional_api_host("api-gateway.unknown.example"));
+    }
+
+    #[test]
+    fn discovers_regional_host_from_tls_client_hello() {
+        let host = b"api-gateway.asia.es-pio.net";
+        let mut server_name = Vec::new();
+        server_name.extend_from_slice(&((host.len() + 3) as u16).to_be_bytes());
+        server_name.push(0);
+        server_name.extend_from_slice(&(host.len() as u16).to_be_bytes());
+        server_name.extend_from_slice(host);
+
+        let mut extension = vec![0, 0];
+        extension.extend_from_slice(&(server_name.len() as u16).to_be_bytes());
+        extension.extend_from_slice(&server_name);
+
+        let mut hello = vec![3, 3];
+        hello.extend_from_slice(&[0; 32]);
+        hello.push(0);
+        hello.extend_from_slice(&2u16.to_be_bytes());
+        hello.extend_from_slice(&[0x13, 0x01]);
+        hello.extend_from_slice(&[1, 0]);
+        hello.extend_from_slice(&(extension.len() as u16).to_be_bytes());
+        hello.extend_from_slice(&extension);
+
+        let mut handshake = vec![1];
+        handshake.extend_from_slice(&[
+            ((hello.len() >> 16) & 0xff) as u8,
+            ((hello.len() >> 8) & 0xff) as u8,
+            (hello.len() & 0xff) as u8,
+        ]);
+        handshake.extend_from_slice(&hello);
+
+        let mut record = vec![22, 3, 1];
+        record.extend_from_slice(&(handshake.len() as u16).to_be_bytes());
+        record.extend_from_slice(&handshake);
+
+        assert_eq!(
+            tls_client_hello_sni(&record).as_deref(),
+            Some("api-gateway.asia.es-pio.net")
+        );
+    }
+
+    #[test]
+    fn emits_native_stats_once_from_the_games_regional_response() {
+        let parser = DiscoveryParser::default();
+        let request_context = StreamContext {
+            connection_id: 7,
+            direction: Direction::ToServer,
+            src_ip: "127.0.0.1".parse().unwrap(),
+            dst_ip: "127.0.0.2".parse().unwrap(),
+            src_port: 50_000,
+            dst_port: 443,
+            bytes_parsed: 0,
+            messages_parsed: 0,
+            alpn: None,
+        };
+        let request = b"POST /v1/pioneer/stats/player-v2 HTTP/1.1\r\nHost: api-gateway.asia.es-pio.net\r\nAuthorization: Bearer header.payload.signature\r\nContent-Length: 2\r\n\r\n{}";
+        let StreamParseResult::Complete {
+            messages: request_messages,
+            ..
+        } = parser.parse_stream(request, &request_context)
+        else {
+            panic!("request was not parsed");
+        };
+        assert!(request_messages.iter().any(|message| {
+            string_field(message, "kind").as_deref() == Some("stats_stream_ready")
+        }));
+        assert!(
+            request_messages
+                .iter()
+                .all(|message| !message.fields.contains_key("token"))
+        );
+
+        let response_context = StreamContext {
+            direction: Direction::ToClient,
+            src_ip: request_context.dst_ip,
+            dst_ip: request_context.src_ip,
+            src_port: request_context.dst_port,
+            dst_port: request_context.src_port,
+            ..request_context
+        };
+        let body = br#"{"scopedPlayerStats":[]}"#;
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+            body.len(),
+            std::str::from_utf8(body).unwrap()
+        );
+        let StreamParseResult::Complete { messages, .. } =
+            parser.parse_stream(response.as_bytes(), &response_context)
+        else {
+            panic!("response was not parsed");
+        };
+        let stats = messages
+            .iter()
+            .find(|message| {
+                string_field(message, "kind").as_deref() == Some("player_stats_response")
+            })
+            .expect("native player stats response");
+        assert_eq!(
+            string_field(stats, "host").as_deref(),
+            Some("api-gateway.asia.es-pio.net")
+        );
+        assert!(string_field(stats, "stats_body").is_some());
     }
 
     #[test]
@@ -913,24 +1048,6 @@ mod tests {
             decode_content(&compressed, Some(&"gzip".to_owned())).unwrap(),
             br#"{"kills":4}"#
         );
-    }
-
-    #[test]
-    fn request_replay_keeps_context_but_rebuilds_transport_headers() {
-        let headers = HashMap::from([
-            ("authorization".to_owned(), "Bearer secret".to_owned()),
-            ("content-length".to_owned(), "13".to_owned()),
-            ("host".to_owned(), "api.example".to_owned()),
-            ("cookie".to_owned(), "session=context".to_owned()),
-            ("x-game-context".to_owned(), "required".to_owned()),
-        ]);
-        let replay = replayable_headers(&headers);
-
-        assert!(!replay.iter().any(|(name, _)| name == "authorization"));
-        assert!(!replay.iter().any(|(name, _)| name == "content-length"));
-        assert!(!replay.iter().any(|(name, _)| name == "host"));
-        assert!(replay.iter().any(|(name, _)| name == "cookie"));
-        assert!(replay.iter().any(|(name, _)| name == "x-game-context"));
     }
 
     #[test]

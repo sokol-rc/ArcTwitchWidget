@@ -26,9 +26,14 @@ pub struct ServerHandle {
     shutdown: Option<oneshot::Sender<()>>,
     worker: Option<thread::JoinHandle<()>>,
     events: broadcast::Sender<String>,
+    port: u16,
 }
 
 impl ServerHandle {
+    pub fn port(&self) -> u16 {
+        self.port
+    }
+
     pub fn notify(&self, state: &AppState) {
         let state = public_state(state);
         if let Ok(payload) = serde_json::to_string(&json!({"type":"state.updated","data":state})) {
@@ -70,10 +75,9 @@ pub fn start(app: Arc<RwLock<AppState>>, storage: Storage, port: u16) -> Result<
                 .route("/overlay/discovery", get(overlay))
                 .route("/overlay/live", get(live_overlay))
                 .with_state(state);
-            let address = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port);
-            match tokio::net::TcpListener::bind(address).await {
-                Ok(listener) => {
-                    let _ = ready_tx.send(Ok(()));
+            match bind_local_listener(port).await {
+                Ok((listener, actual_port)) => {
+                    let _ = ready_tx.send(Ok(actual_port));
                     let _ = axum::serve(listener, router)
                         .with_graceful_shutdown(async {
                             let _ = shutdown_rx.await;
@@ -86,7 +90,7 @@ pub fn start(app: Arc<RwLock<AppState>>, storage: Storage, port: u16) -> Result<
             }
         });
     });
-    ready_rx
+    let actual_port = ready_rx
         .recv_timeout(std::time::Duration::from_secs(5))
         .context("local server did not report readiness")?
         .map_err(anyhow::Error::msg)?;
@@ -94,7 +98,52 @@ pub fn start(app: Arc<RwLock<AppState>>, storage: Storage, port: u16) -> Result<
         shutdown: Some(shutdown_tx),
         worker: Some(worker),
         events,
+        port: actual_port,
     })
+}
+
+async fn bind_local_listener(preferred: u16) -> std::io::Result<(tokio::net::TcpListener, u16)> {
+    let mut candidates = Vec::with_capacity(22);
+    candidates.push(preferred);
+    for offset in 1..=20 {
+        if let Some(port) = preferred.checked_add(offset) {
+            candidates.push(port);
+        }
+    }
+    candidates.push(0);
+
+    let mut last_error = None;
+    for port in candidates {
+        let address = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port);
+        match tokio::net::TcpListener::bind(address).await {
+            Ok(listener) => {
+                let actual_port = listener.local_addr()?.port();
+                return Ok((listener, actual_port));
+            }
+            Err(error) => last_error = Some(error),
+        }
+    }
+    Err(last_error.unwrap_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::AddrNotAvailable,
+            "no local port available",
+        )
+    }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::bind_local_listener;
+
+    #[test]
+    fn selects_an_available_port_when_preferred_is_busy() {
+        let occupied = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let preferred = occupied.local_addr().unwrap().port();
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let (listener, selected) = runtime.block_on(bind_local_listener(preferred)).unwrap();
+        assert_ne!(selected, preferred);
+        assert_eq!(listener.local_addr().unwrap().ip().to_string(), "127.0.0.1");
+    }
 }
 
 async fn health(State(state): State<ServerState>) -> Json<Value> {
@@ -184,7 +233,7 @@ html,body{margin:0;background:transparent;color:#fff;font-family:Inter,Segoe UI,
 </style></head><body><div class="card"><div id="dot" class="dot"></div><div><div class="title">ARC Live Discovery</div><div id="phase" class="phase">Connecting...</div></div><div class="stats"><div><div id="packets" class="n">0</div><div class="k">Packets</div></div><div><div id="decrypt" class="n">0</div><div class="k">Decrypted</div></div><div><div id="obs" class="n">0</div><div class="k">Events</div></div></div></div>
 <script>
 const phase=document.querySelector('#phase'),dot=document.querySelector('#dot'),packets=document.querySelector('#packets'),decrypt=document.querySelector('#decrypt'),obs=document.querySelector('#obs');
-function draw(s){phase.textContent=String(s.phase||'unknown').replaceAll('_',' ');packets.textContent=s.packets_seen||0;decrypt.textContent=s.decrypted_records||0;obs.textContent=s.observations||0;dot.classList.toggle('ok',s.token_seen)}
+function draw(s){phase.textContent=String(s.phase||'unknown').replaceAll('_',' ');packets.textContent=s.packets_seen||0;decrypt.textContent=s.decrypted_records||0;obs.textContent=s.observations||0;dot.classList.toggle('ok',s.stats_stream_ready)}
 async function snapshot(){try{draw(await(await fetch('/api/v1/snapshot')).json())}catch{phase.textContent='Collector offline'}}
 function connect(){const ws=new WebSocket(`ws://${location.host}/ws`);ws.onmessage=e=>{const m=JSON.parse(e.data);draw(m.data)};ws.onclose=()=>setTimeout(connect,1000)}snapshot();connect();
 </script></body></html>"#;

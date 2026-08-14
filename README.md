@@ -1,7 +1,7 @@
 # ARC Live
 
 > **Research status — not approved for public distribution.** This build relies
-> on passive packet inspection and replay of an internal ARC Raiders endpoint.
+> on passive packet inspection of ARC Raiders traffic.
 > Embark has not authorized this integration. Do not distribute or use it on a
 > production account until an approved data source or written permission is
 > available.
@@ -16,12 +16,12 @@ See the current production audit in
 ARC Live is a local-first Windows companion for discovering ARC Raiders raid
 telemetry and rendering normalized statistics in OBS Browser Sources.
 
-The current milestone is the **Consumer Installer 0.10.3 build**. It configures a private TLS
+The current milestone is the **0.11 development build**. It configures a private TLS
 key log, exposes a localhost-only status/overlay server, stores sanitized
-observations in SQLite, and can export a diagnostic bundle that excludes bearer
-tokens and TLS secrets. Normalized player totals start refreshing automatically
-every 15 seconds and update OBS over the local WebSocket without restarting the
-launcher or game.
+observations in SQLite, and can export a diagnostic bundle that excludes TLS
+secrets. When the game returns to Speranza and requests player statistics, ARC
+Live reads that native response once and updates OBS over the local WebSocket.
+ARC Live no longer extracts bearer tokens or repeats the game's API request.
 
 ## Build
 
@@ -38,8 +38,8 @@ files shipped in the release ZIP.
 
 The installed ARC Live GUI runs as a normal user. A small `ArcLiveCapture`
 Windows service, installed once with Administrator approval, owns the passive
-WinDivert capture. Captured credentials and request context remain inside that
-process; the GUI receives only sanitized observations and normalized totals.
+WinDivert capture. The GUI receives only sanitized observations and normalized
+totals.
 The portable ZIP does not install this service and must be started manually
 with **Run as administrator**.
 
@@ -51,9 +51,11 @@ For normal use, run the single `ARC-Live-Setup-<version>.exe`. The ZIP is an
 advanced portable fallback only. Do not move only the portable EXE away from
 its two WinDivert runtime files.
 
-The default local health endpoint is `http://127.0.0.1:17842/api/v1/health`.
+The preferred local health endpoint is `http://127.0.0.1:17842/api/v1/health`.
 The live OBS source is `http://127.0.0.1:17842/overlay/live`; its stable JSON
-contract is available at `/api/v1/overlay`. Use **Show demo data** in the app
+contract is available at `/api/v1/overlay`. If that port is occupied, ARC Live
+selects a free loopback port, saves it, and shows the resulting URL in the app.
+Use **Show demo data** in the app
 to lay out an OBS scene without launching the game.
 
 The widget has five presets selectable in ARC Live: fast PvE (stream loot and
@@ -69,7 +71,7 @@ custom color picker, opacity slider, and blur slider. Session balance is
 rendered with an explicit green plus or red minus.
 
 The current stream baseline and latest calculated overlay are saved to SQLite
-after every successful refresh. If ARC Live, ARC Raiders, Steam, or Windows is
+after every native game statistics response. If ARC Live, ARC Raiders, Steam, or Windows is
 restarted, the app restores today's stream before reconnecting and continues
 from the same counters. The Home screen shows a short user-facing event history
 for the current day. `Сбросить статистику стрима` resets all PvE/PvP stream
@@ -91,12 +93,13 @@ Epic process. If neither launcher is configured, it installs a user-scoped
 closes or restarts the launcher or game; on the first setup only, the setting
 becomes active the next time the launcher starts naturally.
 
-After the in-memory Embark token and the game's request context are observed,
-ARC Live automatically repeats the game's exact read-only
-`POST /v1/pioneer/stats/player-v2` request every 15 seconds. Request
-headers, body values, raw response values, and credentials are never persisted.
-Only the JSON field/type shape and normalized aggregate totals are stored or
-published locally. The versioned `/api/v1/overlay` contract exposes both the five
+ARC Live recognizes regional `*.es-pio.net` API hosts from the game's own TLS
+SNI and HTTP Host values. It passively reads the native
+`POST /v1/pioneer/stats/player-v2` response sent when the player returns to
+Speranza. There is no timer, request replay, or extra call to Embark. Raw response
+values are never persisted. Only the JSON field/type shape and normalized
+aggregate totals are stored or published locally. The versioned
+`/api/v1/overlay` contract exposes both the five
 default overlay totals and additional known counters such as ARC eliminations,
 downs, revives, damage, duration, and XP.
 
@@ -110,7 +113,8 @@ For the first real ARC Raiders capture, follow
 ## Security boundary
 
 - The HTTP server binds to loopback only.
-- Bearer tokens and TLS secrets are never written to logs or diagnostic bundles.
+- Bearer tokens are not extracted; TLS secrets are never written to logs or
+  diagnostic bundles.
 - The user-scoped TLS key log is retained locally so ARC Live can attach after
   the game starts; it is stored under `%LOCALAPPDATA%\ARC Live` and never exported.
 - The app does not read game memory, inject code, or automate input.
@@ -123,11 +127,10 @@ For the first real ARC Raiders capture, follow
 
 ## Consumer release
 
-Download the current installer from
-[GitHub Releases](https://github.com/sokol-rc/ArcTwitchWidget/releases/latest).
-Version 0.10.3 is the first build connected to the public update channel, so it
-must be installed manually once. Later stable releases are discovered and
-installed from inside ARC Live.
+The earlier 0.10.3 release was withdrawn. A new installer will be published
+only after the dynamic-region and lobby-event flow passes a live raid test.
+[GitHub Releases](https://github.com/sokol-rc/ArcTwitchWidget/releases) remains
+the update source once that validated build is available.
 
 The update channels have permanent addresses:
 

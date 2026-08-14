@@ -4,6 +4,8 @@ use anyhow::Result;
 pub struct SingleInstanceGuard {
     handle: windows_sys::Win32::Foundation::HANDLE,
     pub activation: crossbeam_channel::Receiver<()>,
+    activation_address: std::net::SocketAddr,
+    activation_file: std::path::PathBuf,
     stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
     worker: Option<std::thread::JoinHandle<()>>,
 }
@@ -28,8 +30,9 @@ pub fn acquire() -> Result<Option<SingleInstanceGuard>> {
     }
     if unsafe { GetLastError() } == ERROR_ALREADY_EXISTS {
         unsafe { CloseHandle(handle) };
-        if let Ok(socket) = std::net::UdpSocket::bind("127.0.0.1:0")
-            && socket.send_to(b"show", "127.0.0.1:17844").is_ok()
+        if let Some(address) = read_activation_address()
+            && let Ok(socket) = std::net::UdpSocket::bind("127.0.0.1:0")
+            && socket.send_to(b"show", address).is_ok()
         {
             return Ok(None);
         }
@@ -45,7 +48,10 @@ pub fn acquire() -> Result<Option<SingleInstanceGuard>> {
         };
         return Ok(None);
     }
-    let socket = std::net::UdpSocket::bind("127.0.0.1:17844")?;
+    let socket = std::net::UdpSocket::bind("127.0.0.1:0")?;
+    let activation_address = socket.local_addr()?;
+    let activation_file = activation_file();
+    let _ = std::fs::write(&activation_file, activation_address.to_string());
     socket.set_read_timeout(Some(std::time::Duration::from_millis(500)))?;
     let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let worker_stop = std::sync::Arc::clone(&stop);
@@ -70,6 +76,8 @@ pub fn acquire() -> Result<Option<SingleInstanceGuard>> {
     Ok(Some(SingleInstanceGuard {
         handle,
         activation,
+        activation_address,
+        activation_file,
         stop,
         worker: Some(worker),
     }))
@@ -86,7 +94,7 @@ impl Drop for SingleInstanceGuard {
     fn drop(&mut self) {
         self.stop.store(true, std::sync::atomic::Ordering::Relaxed);
         if let Ok(socket) = std::net::UdpSocket::bind("127.0.0.1:0") {
-            let _ = socket.send_to(b"stop", "127.0.0.1:17844");
+            let _ = socket.send_to(b"stop", self.activation_address);
         }
         if let Some(worker) = self.worker.take() {
             let _ = worker.join();
@@ -94,7 +102,25 @@ impl Drop for SingleInstanceGuard {
         unsafe {
             windows_sys::Win32::Foundation::CloseHandle(self.handle);
         }
+        if std::fs::read_to_string(&self.activation_file)
+            .ok()
+            .is_some_and(|value| value.trim() == self.activation_address.to_string())
+        {
+            let _ = std::fs::remove_file(&self.activation_file);
+        }
     }
+}
+
+#[cfg(windows)]
+fn activation_file() -> std::path::PathBuf {
+    std::env::temp_dir().join("arc-live-activation.address")
+}
+
+#[cfg(windows)]
+fn read_activation_address() -> Option<std::net::SocketAddr> {
+    let value = std::fs::read_to_string(activation_file()).ok()?;
+    let address: std::net::SocketAddr = value.trim().parse().ok()?;
+    address.ip().is_loopback().then_some(address)
 }
 
 #[cfg(windows)]

@@ -1,5 +1,5 @@
 use std::sync::{Arc, RwLock};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use arc_live_collector::{CollectorEvent, ProbePayload};
 use arc_live_core::config::AppConfig;
@@ -40,9 +40,6 @@ pub struct ArcLiveApp {
     updates: UpdateManager,
     tray: Option<TrayController>,
     instance: SingleInstanceGuard,
-    probing_stats: bool,
-    live_stats_enabled: bool,
-    next_stats_probe: Instant,
     session_baseline: Option<OverlayStats>,
     stream_day: String,
     stream_started_at: Option<DateTime<Utc>>,
@@ -131,9 +128,6 @@ impl ArcLiveApp {
             updates,
             tray: TrayController::new().ok(),
             instance,
-            probing_stats: false,
-            live_stats_enabled: true,
-            next_stats_probe: Instant::now(),
             session_baseline,
             stream_day,
             stream_started_at,
@@ -234,7 +228,6 @@ impl ArcLiveApp {
             "info",
             "Начался новый день — счётчики стрима продолжат работу после синхронизации",
         );
-        self.next_stats_probe = Instant::now();
     }
 
     fn start_new_stream(&mut self) {
@@ -327,19 +320,17 @@ impl ArcLiveApp {
                     state.tls_decrypt_errors = stats.tls_decrypt_errors;
                     state.last_tls_sni = stats.last_tls_sni;
                     state.last_embark_sni = stats.last_embark_sni;
+                    state.regional_api_hosts = stats.regional_api_hosts;
                     state.decrypted_records = stats.decrypted_records;
                     state.observations = stats.observations;
                     state.active_capture_connections = stats.active_connections;
                     state.capture_buffered_bytes = stats.buffered_bytes;
                     state.capture_connections_evicted = stats.connections_evicted;
                 }
-                CollectorEvent::Ready {
-                    token_seen,
-                    request_template_seen,
-                } => {
-                    self.collector_ready = token_seen && request_template_seen;
+                CollectorEvent::Ready { stats_stream_ready } => {
+                    self.collector_ready = stats_stream_ready;
                     let mut state = self.state.write().expect("state poisoned");
-                    state.token_seen = token_seen;
+                    state.stats_stream_ready = stats_stream_ready;
                     if self.collector_ready {
                         state.phase = CollectorPhase::TokenReady;
                         state.record("success", "Player statistics connection is ready");
@@ -427,8 +418,8 @@ impl ArcLiveApp {
         let observation = Observation {
             id: 0,
             observed_at: payload.observed_at,
-            direction: "active_probe_response".to_owned(),
-            host: "api-gateway.europe.es-pio.net".to_owned(),
+            direction: "game_stats_response".to_owned(),
+            host: payload.host.clone(),
             method: Some("POST".to_owned()),
             path: Some("/v1/pioneer/stats/player-v2".to_owned()),
             status: Some(payload.status),
@@ -479,25 +470,21 @@ impl ArcLiveApp {
             state.record(
                 "success",
                 format!(
-                    "Live stats synced (HTTP {}, {} rows, {} currently unmapped)",
+                    "Game stats received on lobby return (HTTP {}, {} rows, {} currently unmapped)",
                     payload.status, stats_rows, payload.unknown_event_rows
                 ),
             );
         }
         self.persist_stream_session(&overlay);
-        if !self.last_sync_succeeded {
-            self.record_user_event(
-                "success",
-                "Статистика подключена — текущий стрим восстановлен и обновляется",
-            );
-        }
+        self.record_user_event(
+            "success",
+            if self.last_sync_succeeded {
+                "Статистика обновлена после возвращения в Сперанцу"
+            } else {
+                "Статистика подключена и текущий стрим восстановлен"
+            },
+        );
         self.last_sync_succeeded = true;
-    }
-
-    fn probe_stats(&mut self) {}
-
-    fn maybe_probe_stats(&mut self) {
-        self.probing_stats = false;
     }
 
     fn save_overlay_preferences(&mut self, overlay: &arc_live_core::state::OverlayStats) {
@@ -625,7 +612,6 @@ impl ArcLiveApp {
             root.ctx().send_viewport_cmd(egui::ViewportCommand::Focus);
         }
         self.drain_events();
-        self.maybe_probe_stats();
         root.ctx()
             .request_repaint_after(std::time::Duration::from_millis(250));
         let snapshot = self.state.read().expect("state poisoned").clone();
@@ -638,7 +624,7 @@ impl ArcLiveApp {
             egui::Frame::group(ui.style()).show(ui, |ui| {
                 ui.horizontal(|ui| {
                     ui.label(RichText::new(format!("{:?}", snapshot.phase)).strong());
-                    if snapshot.token_seen { ui.colored_label(Color32::from_rgb(83, 224, 161), "Embark token ready"); }
+                    if snapshot.stats_stream_ready { ui.colored_label(Color32::from_rgb(83, 224, 161), "Regional stats stream ready"); }
                     else { ui.colored_label(Color32::from_rgb(246, 183, 60), "Waiting for token"); }
                 });
                 ui.separator();
@@ -903,38 +889,14 @@ impl ArcLiveApp {
             }
 
             ui.add_space(12.0);
-            ui.heading("3. Live player stats");
-            ui.label("A read-only request follows the same player-stats contract as the game. Raw response values, captured request context, and credentials stay in memory; only normalized totals are exposed to OBS.");
+            ui.heading("3. Автоматическая статистика");
+            ui.label("ARC Live ждёт штатный ответ игры со статистикой. Игра отправляет его при возвращении в Сперанцу, поэтому таймера и дополнительных запросов к Embark больше нет.");
             let ready = self.collector_ready;
-            ui.horizontal(|ui| {
-                if !self.live_stats_enabled {
-                    if ui
-                        .add_enabled(ready && !self.probing_stats, egui::Button::new("Start live OBS sync"))
-                        .clicked()
-                    {
-                        self.live_stats_enabled = true;
-                        self.next_stats_probe = Instant::now();
-                        self.probe_stats();
-                    }
-                } else if ui.button("Stop live OBS sync").clicked() {
-                    self.live_stats_enabled = false;
-                }
-                if ui
-                    .add_enabled(ready && !self.probing_stats, egui::Button::new("Refresh now"))
-                    .clicked()
-                {
-                    self.probe_stats();
-                }
-                if self.live_stats_enabled {
-                    ui.colored_label(Color32::from_rgb(83, 224, 161), "Auto-refresh: every 15 seconds");
-                }
-            });
-            if self.probing_stats {
-                ui.spinner();
-                ui.label("Syncing normalized player stats...");
+            if ready {
+                ui.colored_label(Color32::from_rgb(83, 224, 161), "Региональный поток статистики найден");
             }
-            if snapshot.token_seen && !self.collector_ready {
-                ui.label("Waiting for the game's player stats request context...");
+            if snapshot.stats_stream_ready && !self.collector_ready {
+                ui.label("Waiting for the game's regional player-stats response...");
             }
             if snapshot.overlay.stats_rows > 0 {
                 ui.label(format!(
@@ -1021,7 +983,6 @@ impl eframe::App for ArcLiveApp {
         }
         self.rollover_day_if_needed();
         self.drain_events();
-        self.maybe_probe_stats();
         root.ctx().request_repaint_after(Duration::from_millis(250));
         let snapshot = self.state.read().expect("state poisoned").clone();
         let ready = self.collector_ready;
@@ -1074,12 +1035,7 @@ impl eframe::App for ArcLiveApp {
                             if snapshot.game_running && ready {
                                 ui.heading("Всё работает");
                                 ui.label("ARC Live подключилась к игре и обновляет статистику автоматически.");
-                                if self.probing_stats {
-                                    ui.horizontal(|ui| {
-                                        ui.spinner();
-                                        ui.label("Получаем свежую статистику…");
-                                    });
-                                } else if snapshot.overlay.stats_rows > 0 {
+                                if snapshot.overlay.stats_rows > 0 {
                                     ui.colored_label(
                                         Color32::from_rgb(83, 224, 161),
                                         "Данные для OBS актуальны",
@@ -1576,7 +1532,6 @@ impl eframe::App for ArcLiveApp {
                                     state.clone()
                                 };
                                 self.server.notify(&updated);
-                                self.next_stats_probe = Instant::now();
                             }
                             if ui.button("Баланс + / −").clicked() {
                                 let updated = {

@@ -7,7 +7,8 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, ensure};
 use arc_live_collector::{
-    DEFAULT_SERVICE_ADDRESS, SERVICE_PROTOCOL_VERSION, ServiceRequest, start_local,
+    DEFAULT_SERVICE_ADDRESS, SERVICE_PROTOCOL_VERSION, ServiceRequest, service_address_file,
+    start_local,
 };
 use sha2::{Digest, Sha256};
 use zeroize::Zeroize;
@@ -142,10 +143,10 @@ fn service_main_inner() -> Result<()> {
 }
 
 fn run_server(stop: Arc<AtomicBool>) -> Result<()> {
-    let listener = TcpListener::bind(DEFAULT_SERVICE_ADDRESS)
-        .with_context(|| format!("binding capture service to {DEFAULT_SERVICE_ADDRESS}"))?;
+    let (listener, address) = bind_service_listener()?;
     listener.set_nonblocking(true)?;
-    tracing::info!(address = DEFAULT_SERVICE_ADDRESS, "capture service ready");
+    publish_service_address(&address.to_string())?;
+    tracing::info!(address = %address, "capture service ready");
 
     while !stop.load(Ordering::Relaxed) {
         match listener.accept() {
@@ -161,6 +162,29 @@ fn run_server(stop: Arc<AtomicBool>) -> Result<()> {
         }
     }
     Ok(())
+}
+
+fn bind_service_listener() -> Result<(TcpListener, std::net::SocketAddr)> {
+    bind_service_listener_at(DEFAULT_SERVICE_ADDRESS)
+}
+
+fn bind_service_listener_at(preferred: &str) -> Result<(TcpListener, std::net::SocketAddr)> {
+    let listener = TcpListener::bind(preferred)
+        .or_else(|_| TcpListener::bind("127.0.0.1:0"))
+        .context("binding capture service to a local address")?;
+    let address = listener.local_addr()?;
+    Ok((listener, address))
+}
+
+fn publish_service_address(address: &str) -> Result<()> {
+    let Some(path) = service_address_file() else {
+        return Ok(());
+    };
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(&path, address)
+        .with_context(|| format!("publishing capture service address to {}", path.display()))
 }
 
 fn serve_client(mut stream: TcpStream, service_stop: Arc<AtomicBool>) -> Result<()> {
@@ -271,5 +295,15 @@ mod tests {
         wrong.auth_token = "b".repeat(64);
         assert!(authenticate_request(&wrong).is_err());
         let _ = std::fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn capture_service_falls_back_when_preferred_port_is_busy() {
+        let occupied = TcpListener::bind("127.0.0.1:0").unwrap();
+        let preferred = occupied.local_addr().unwrap();
+        let (listener, selected) = bind_service_listener_at(&preferred.to_string()).unwrap();
+        assert_ne!(selected, preferred);
+        assert!(selected.ip().is_loopback());
+        drop(listener);
     }
 }

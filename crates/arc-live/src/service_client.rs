@@ -6,10 +6,10 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 use std::time::Duration;
 
-use anyhow::{Context, Result};
+use anyhow::{Result, ensure};
 use arc_live_collector::{
     CollectorEvent, CollectorHandle, DEFAULT_SERVICE_ADDRESS, SERVICE_PROTOCOL_VERSION,
-    ServiceRequest,
+    ServiceRequest, parse_local_service_address, service_address_file,
 };
 use crossbeam_channel::{Receiver, bounded};
 
@@ -50,9 +50,36 @@ pub struct RemoteCollector {
 
 impl RemoteCollector {
     fn connect(keylog_path: PathBuf, auth_token: String) -> Result<Self> {
-        let address: SocketAddr = DEFAULT_SERVICE_ADDRESS.parse()?;
-        let mut socket = TcpStream::connect_timeout(&address, Duration::from_millis(500))
-            .context("connecting to ARC Live Capture Service")?;
+        let mut addresses = Vec::new();
+        if let Some(path) = service_address_file()
+            && let Ok(value) = std::fs::read_to_string(path)
+            && let Some(address) = parse_local_service_address(&value)
+        {
+            addresses.push(address);
+        }
+        let default_address: SocketAddr = DEFAULT_SERVICE_ADDRESS.parse()?;
+        if !addresses.contains(&default_address) {
+            addresses.push(default_address);
+        }
+        let mut last_error = None;
+        let mut socket = None;
+        for address in addresses {
+            match TcpStream::connect_timeout(&address, Duration::from_millis(500)) {
+                Ok(connected) => {
+                    socket = Some(connected);
+                    break;
+                }
+                Err(error) => last_error = Some(error),
+            }
+        }
+        let mut socket = socket.ok_or_else(|| {
+            anyhow::anyhow!(
+                "connecting to ARC Live Capture Service failed: {}",
+                last_error
+                    .map(|error| error.to_string())
+                    .unwrap_or_else(|| "no service address".to_owned())
+            )
+        })?;
         socket.set_nodelay(true)?;
         let request = ServiceRequest {
             protocol_version: SERVICE_PROTOCOL_VERSION,
@@ -64,12 +91,29 @@ impl RemoteCollector {
         socket.flush()?;
 
         let reader_socket = socket.try_clone()?;
-        reader_socket.set_read_timeout(Some(Duration::from_millis(500)))?;
+        reader_socket.set_read_timeout(Some(Duration::from_secs(2)))?;
+        let mut reader = BufReader::new(reader_socket);
+        let mut handshake_line = String::new();
+        ensure!(
+            reader.read_line(&mut handshake_line)? > 0,
+            "capture service closed before handshake"
+        );
+        let handshake: CollectorEvent = serde_json::from_str(&handshake_line)?;
+        ensure!(
+            matches!(
+                &handshake,
+                CollectorEvent::Connected { version, .. } if version == env!("CARGO_PKG_VERSION")
+            ),
+            "capture service version does not match the application"
+        );
+        reader
+            .get_ref()
+            .set_read_timeout(Some(Duration::from_millis(500)))?;
         let stop = Arc::new(AtomicBool::new(false));
         let worker_stop = Arc::clone(&stop);
         let (tx, events) = bounded(256);
+        let _ = tx.try_send(handshake);
         let worker = thread::spawn(move || {
-            let mut reader = BufReader::new(reader_socket);
             while !worker_stop.load(Ordering::Relaxed) {
                 let mut line = String::new();
                 match reader.read_line(&mut line) {

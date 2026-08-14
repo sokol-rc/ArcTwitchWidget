@@ -1,6 +1,7 @@
 # ARC Live local API
 
-The server binds only to `127.0.0.1`. Its default port is `17842` and can be
+The server binds only to `127.0.0.1`. Its preferred port is `17842`; if busy,
+ARC Live selects and persists a free loopback port. The selected port can be
 changed in `%LOCALAPPDATA%\ARC Live\config.json`.
 
 ## Endpoints

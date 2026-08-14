@@ -39,7 +39,7 @@ fn run() -> Result<()> {
     };
     let paths = AppPaths::discover()?;
     let service_token = paths.load_or_create_service_token()?;
-    let config = AppConfig::load_or_create(&paths.config)?;
+    let mut config = AppConfig::load_or_create(&paths.config)?;
     let (widget_config, widget_config_warning) =
         match WidgetConfig::load_or_create(&paths.widget_config) {
             Ok(config) => (config, None),
@@ -94,6 +94,24 @@ fn run() -> Result<()> {
         storage.clone(),
         config.local_port,
     )?;
+    let actual_local_port = server.port();
+    {
+        let mut state = shared_state.write().expect("state poisoned");
+        state.local_url = format!("http://127.0.0.1:{actual_local_port}");
+        if actual_local_port != config.local_port {
+            state.record(
+                "warning",
+                format!(
+                    "Local port {} was busy; ARC Live selected and saved {}",
+                    config.local_port, actual_local_port
+                ),
+            );
+        }
+    }
+    if actual_local_port != config.local_port {
+        config.local_port = actual_local_port;
+        config.save(&paths.config)?;
+    }
     let collector = service_client::CollectorRuntime::connect_or_start_local(
         keylog_path.clone(),
         service_token,

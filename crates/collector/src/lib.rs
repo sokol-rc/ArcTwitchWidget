@@ -1,11 +1,11 @@
-use std::io::Read;
+use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
-use anyhow::{Context, Result, bail};
+use anyhow::Result;
 use arc_live_capture::{CaptureEvent, CaptureStats};
 use arc_live_core::redaction::json_shape;
 use arc_live_core::state::OverlayStats;
@@ -14,15 +14,22 @@ use chrono::{DateTime, Utc};
 use crossbeam_channel::{Receiver, Sender, bounded};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use zeroize::{Zeroize, Zeroizing};
 
-const ENDPOINT: &str = "https://api-gateway.europe.es-pio.net/v1/pioneer/stats/player-v2";
-const MAX_RESPONSE_BYTES: u64 = 4 * 1024 * 1024;
-const LIVE_SYNC_INTERVAL: Duration = Duration::from_secs(15);
-const LIVE_SYNC_ERROR_BACKOFF: Duration = Duration::from_secs(30);
-
-pub const SERVICE_PROTOCOL_VERSION: u8 = 1;
+pub const SERVICE_PROTOCOL_VERSION: u8 = 2;
 pub const DEFAULT_SERVICE_ADDRESS: &str = "127.0.0.1:17843";
+
+pub fn service_address_file() -> Option<PathBuf> {
+    std::env::var_os("PROGRAMDATA").map(|root| {
+        PathBuf::from(root)
+            .join("ARC Live")
+            .join("capture-service.address")
+    })
+}
+
+pub fn parse_local_service_address(value: &str) -> Option<SocketAddr> {
+    let address: SocketAddr = value.trim().parse().ok()?;
+    address.ip().is_loopback().then_some(address)
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ServiceRequest {
@@ -42,8 +49,7 @@ pub enum CollectorEvent {
     Stats(Box<CaptureStats>),
     Observation(Value),
     Ready {
-        token_seen: bool,
-        request_template_seen: bool,
+        stats_stream_ready: bool,
     },
     Probe(Box<ProbePayload>),
     Error(String),
@@ -53,27 +59,12 @@ pub enum CollectorEvent {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProbePayload {
     pub observed_at: DateTime<Utc>,
+    pub host: String,
     pub status: u16,
     pub content_type: Option<String>,
     pub shape: Value,
     pub overlay: OverlayStats,
     pub unknown_event_rows: u64,
-}
-
-#[derive(Clone)]
-struct SensitiveRequestTemplate {
-    headers: Vec<(String, String)>,
-    body: Vec<u8>,
-}
-
-impl Drop for SensitiveRequestTemplate {
-    fn drop(&mut self) {
-        for (name, value) in &mut self.headers {
-            name.zeroize();
-            value.zeroize();
-        }
-        self.body.zeroize();
-    }
 }
 
 pub struct CollectorHandle {
@@ -123,17 +114,8 @@ fn run_collector(
     stop: Arc<AtomicBool>,
     tx: &Sender<CollectorEvent>,
 ) -> Result<()> {
-    let probe_client = reqwest::blocking::Client::builder()
-        .timeout(Duration::from_secs(20))
-        .pool_max_idle_per_host(1)
-        .build()
-        .context("building stats client")?;
     let capture = arc_live_capture::start_capture(keylog_path);
-    let (probe_tx, probe_rx) = bounded::<Result<ProbePayload, String>>(1);
-    let mut token: Option<Zeroizing<String>> = None;
-    let mut template: Option<SensitiveRequestTemplate> = None;
-    let mut probe_in_flight = false;
-    let mut next_probe = Instant::now();
+    let mut stats_stream_ready = false;
 
     while !stop.load(Ordering::Relaxed) {
         match capture.events.recv_timeout(Duration::from_millis(200)) {
@@ -146,26 +128,35 @@ fn run_collector(
             Ok(CaptureEvent::Observation(value)) => {
                 tx.try_send(CollectorEvent::Observation(value)).ok();
             }
-            Ok(CaptureEvent::Token {
-                token: next_token,
-                fingerprint,
-            }) => {
-                token = Some(Zeroizing::new(next_token));
+            Ok(CaptureEvent::StatsStreamReady { host }) => {
+                stats_stream_ready = true;
                 tx.try_send(CollectorEvent::Status(format!(
-                    "Embark credentials observed ({fingerprint})"
+                    "Regional player statistics stream observed ({host})"
                 )))
                 .ok();
-                send_ready(tx, token.is_some(), template.is_some());
-                next_probe = Instant::now();
+                send_ready(tx, true);
             }
-            Ok(CaptureEvent::StatsRequestTemplate { headers, body }) => {
-                template = Some(SensitiveRequestTemplate { headers, body });
-                tx.try_send(CollectorEvent::Status(
-                    "Player statistics request context observed".to_owned(),
-                ))
-                .ok();
-                send_ready(tx, token.is_some(), template.is_some());
-                next_probe = Instant::now();
+            Ok(CaptureEvent::PlayerStatsResponse {
+                host,
+                status,
+                content_type,
+                body,
+            }) => {
+                if !stats_stream_ready {
+                    stats_stream_ready = true;
+                    send_ready(tx, true);
+                }
+                match native_stats_payload(host, status, content_type, body) {
+                    Ok(payload) => {
+                        tx.try_send(CollectorEvent::Probe(Box::new(payload))).ok();
+                    }
+                    Err(error) => {
+                        tx.try_send(CollectorEvent::Error(format!(
+                            "Reading game player stats response failed: {error:#}"
+                        )))
+                        .ok();
+                    }
+                }
             }
             Ok(CaptureEvent::Error(message)) => {
                 tx.try_send(CollectorEvent::Error(message)).ok();
@@ -174,93 +165,27 @@ fn run_collector(
             Err(crossbeam_channel::RecvTimeoutError::Timeout) => {}
             Err(crossbeam_channel::RecvTimeoutError::Disconnected) => break,
         }
-
-        while let Ok(result) = probe_rx.try_recv() {
-            probe_in_flight = false;
-            match result {
-                Ok(payload) => {
-                    tx.try_send(CollectorEvent::Probe(Box::new(payload))).ok();
-                    next_probe = Instant::now() + LIVE_SYNC_INTERVAL;
-                }
-                Err(error) => {
-                    tx.try_send(CollectorEvent::Error(error)).ok();
-                    next_probe = Instant::now() + LIVE_SYNC_ERROR_BACKOFF;
-                }
-            }
-        }
-
-        if !probe_in_flight
-            && Instant::now() >= next_probe
-            && let (Some(token), Some(template)) = (&token, &template)
-        {
-            let token = token.to_string();
-            let template = template.clone();
-            let probe_tx = probe_tx.clone();
-            let probe_client = probe_client.clone();
-            probe_in_flight = true;
-            thread::spawn(move || {
-                let token = Zeroizing::new(token);
-                let result = probe(&probe_client, &token, &template.headers, &template.body)
-                    .map_err(|error| format!("Player stats sync failed: {error:#}"));
-                let _ = probe_tx.try_send(result);
-            });
-        }
     }
     capture.stop();
     Ok(())
 }
 
-fn send_ready(tx: &Sender<CollectorEvent>, token_seen: bool, request_template_seen: bool) {
-    tx.try_send(CollectorEvent::Ready {
-        token_seen,
-        request_template_seen,
-    })
-    .ok();
+fn send_ready(tx: &Sender<CollectorEvent>, stats_stream_ready: bool) {
+    tx.try_send(CollectorEvent::Ready { stats_stream_ready })
+        .ok();
 }
 
-fn probe(
-    client: &reqwest::blocking::Client,
-    token: &str,
-    headers: &[(String, String)],
-    request_body: &[u8],
+fn native_stats_payload(
+    host: String,
+    status: u16,
+    content_type: Option<String>,
+    value: Value,
 ) -> Result<ProbePayload> {
-    let mut request = client.post(ENDPOINT);
-    for (name, value) in headers {
-        let name = reqwest::header::HeaderName::from_bytes(name.as_bytes())
-            .with_context(|| format!("invalid captured request header name: {name}"))?;
-        let value = reqwest::header::HeaderValue::from_str(value)
-            .context("invalid captured request header value")?;
-        request = request.header(name, value);
-    }
-    let mut response = request
-        .bearer_auth(token)
-        .body(request_body.to_vec())
-        .send()
-        .context("sending read-only player stats request")?;
-    let status = response.status();
-    let content_type = response
-        .headers()
-        .get(reqwest::header::CONTENT_TYPE)
-        .and_then(|value| value.to_str().ok())
-        .map(str::to_owned);
-    if !status.is_success() {
-        bail!("player stats endpoint returned HTTP {}", status.as_u16());
-    }
-    let mut body = Vec::new();
-    response
-        .by_ref()
-        .take(MAX_RESPONSE_BYTES + 1)
-        .read_to_end(&mut body)
-        .context("reading player stats response")?;
-    if body.len() > MAX_RESPONSE_BYTES as usize {
-        bail!("player stats response exceeded 4 MiB safety limit");
-    }
-    let value: Value =
-        serde_json::from_slice(&body).context("player stats response was not JSON")?;
     let (overlay, unknown_event_rows) = normalize_player_stats(&value)?;
     Ok(ProbePayload {
         observed_at: Utc::now(),
-        status: status.as_u16(),
+        host,
+        status,
         content_type,
         shape: json_shape(&value, 0),
         overlay,
@@ -285,5 +210,13 @@ mod tests {
         assert!(!json.contains("bearer"));
         let restored: ServiceRequest = serde_json::from_str(&json).unwrap();
         assert_eq!(restored.protocol_version, SERVICE_PROTOCOL_VERSION);
+    }
+
+    #[test]
+    fn service_discovery_only_accepts_loopback_addresses() {
+        assert!(parse_local_service_address("127.0.0.1:43123").is_some());
+        assert!(parse_local_service_address("[::1]:43123").is_some());
+        assert!(parse_local_service_address("0.0.0.0:43123").is_none());
+        assert!(parse_local_service_address("example.test:43123").is_none());
     }
 }

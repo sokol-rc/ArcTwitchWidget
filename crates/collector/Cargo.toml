@@ -8,10 +8,7 @@ license.workspace = true
 anyhow.workspace = true
 chrono.workspace = true
 crossbeam-channel.workspace = true
-reqwest.workspace = true
 serde.workspace = true
 serde_json.workspace = true
-zeroize.workspace = true
 arc-live-capture = { path = "../capture" }
 arc-live-core = { path = "../core" }
-
