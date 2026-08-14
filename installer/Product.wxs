@@ -1,0 +1,80 @@
+<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs">
+  <Package
+      Name="ARC Live"
+      Manufacturer="ARC Live"
+      Version="$(var.ProductVersion)"
+      UpgradeCode="8BD84453-0BBE-4B76-982D-383A365EF6E3"
+      Language="1049"
+      Scope="perMachine">
+    <SummaryInformation Description="ARC Raiders live statistics for OBS" />
+    <MajorUpgrade DowngradeErrorMessage="Установлена более новая версия ARC Live." />
+    <MediaTemplate EmbedCab="yes" CompressionLevel="high" />
+
+    <Feature Id="MainFeature" Title="ARC Live" Level="1">
+      <ComponentGroupRef Id="ApplicationComponents" />
+    </Feature>
+
+    <StandardDirectory Id="ProgramFiles64Folder">
+      <Directory Id="INSTALLFOLDER" Name="ARC Live" />
+    </StandardDirectory>
+    <StandardDirectory Id="ProgramMenuFolder">
+      <Directory Id="ApplicationProgramsFolder" Name="ARC Live" />
+    </StandardDirectory>
+
+    <ComponentGroup Id="ApplicationComponents" Directory="INSTALLFOLDER">
+      <Component Id="MainExecutable" Guid="2A260626-04D0-4BBD-BDA1-C08D4564B2AE">
+        <File Id="ArcLiveExe" Source="$(var.StageDir)\arc-live.exe" KeyPath="yes" />
+      </Component>
+      <Component Id="CaptureService" Guid="07C12C05-6696-46ED-AB82-3EF1BA48E67A">
+        <File Id="CaptureServiceExe" Source="$(var.StageDir)\arc-live-capture-service.exe" KeyPath="yes" />
+        <ServiceInstall
+            Id="CaptureServiceInstall"
+            Name="ArcLiveCapture"
+            DisplayName="ARC Live Capture Service"
+            Description="Пассивный сбор статистики ARC Raiders для ARC Live"
+            Type="ownProcess"
+            Start="auto"
+            ErrorControl="normal"
+            Account="LocalSystem"
+            Vital="yes" />
+        <ServiceControl
+            Id="CaptureServiceControl"
+            Name="ArcLiveCapture"
+            Start="install"
+            Stop="both"
+            Remove="uninstall"
+            Wait="yes" />
+      </Component>
+      <Component Id="WinDivertRuntime" Guid="BF4EC85E-ABE4-49F5-9B0F-E7165B8C3058">
+        <File Id="WinDivertDll" Source="$(var.StageDir)\WinDivert.dll" KeyPath="yes" />
+        <File Id="WinDivertDriver" Source="$(var.StageDir)\WinDivert64.sys" />
+      </Component>
+      <Component Id="Documentation" Guid="5EDFEC84-212C-4276-B28B-C79583EAFABC">
+        <File Id="ThirdPartyNotices" Source="$(var.StageDir)\THIRD-PARTY-NOTICES.md" KeyPath="yes" />
+        <File Id="DefaultWidgetConfig" Source="$(var.StageDir)\widget-config.default.json" />
+      </Component>
+      <Component Id="StartMenuShortcut" Directory="ApplicationProgramsFolder" Guid="*">
+        <Shortcut
+            Id="ApplicationStartMenuShortcut"
+            Name="ARC Live"
+            Description="Статистика ARC Raiders для OBS"
+            Target="[#ArcLiveExe]"
+            WorkingDirectory="INSTALLFOLDER" />
+        <RemoveFolder Id="RemoveApplicationProgramsFolder" On="uninstall" />
+        <RegistryValue
+            Root="HKLM"
+            Key="Software\ARC Live"
+            Name="Installed"
+            Type="integer"
+            Value="1"
+            KeyPath="yes" />
+        <RegistryValue
+            Root="HKLM"
+            Key="Software\Microsoft\Windows\CurrentVersion\Run"
+            Name="ARC Live"
+            Type="string"
+            Value="&quot;[#ArcLiveExe]&quot; --background" />
+      </Component>
+    </ComponentGroup>
+  </Package>
+</Wix>

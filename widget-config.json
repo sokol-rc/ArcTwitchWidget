@@ -1,0 +1,60 @@
+{
+  "schema_version": 1,
+  "account": [
+    {
+      "source": "account.event.200.target.995408715",
+      "subtract": [],
+      "label_ru": "Ноки игроков",
+      "label_en": "Player knocks"
+    },
+    {
+      "source": "account.event.101",
+      "subtract": [
+        "account.event.101.target.995408715",
+        "account.event.101.target.200993951"
+      ],
+      "label_ru": "Урон рейдерам",
+      "label_en": "Raider damage"
+    },
+    {
+      "source": "account.loot_value",
+      "subtract": [],
+      "label_ru": "Вынесено",
+      "label_en": "Extracted value"
+    }
+  ],
+  "session": [
+    {
+      "source": "session.event.200.target.995408715",
+      "subtract": [],
+      "label_ru": "Ноки за стрим",
+      "label_en": "Stream knocks"
+    },
+    {
+      "source": "session.extractions",
+      "subtract": [],
+      "label_ru": "Успешные выходы",
+      "label_en": "Successful exits"
+    },
+    {
+      "source": "session.money_delta",
+      "subtract": [],
+      "label_ru": "Баланс",
+      "label_en": "Balance"
+    }
+  ],
+  "outcome": [
+    {
+      "source": "outcome.wins",
+      "subtract": [],
+      "label_ru": "Вышел живым",
+      "label_en": "Extracted alive"
+    },
+    {
+      "source": "outcome.losses",
+      "subtract": [],
+      "label_ru": "Погиб",
+      "label_en": "Knocked out"
+    }
+  ]
+}

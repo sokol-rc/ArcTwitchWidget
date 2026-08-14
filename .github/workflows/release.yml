@@ -1,0 +1,78 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v[0-9]+.[0-9]+.[0-9]+"
+      - "v[0-9]+.[0-9]+.[0-9]+-*"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  release:
+    runs-on: windows-latest
+    env:
+      ARC_LIVE_UPDATE_SIGNING_KEY: ${{ secrets.ARC_LIVE_UPDATE_SIGNING_KEY }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Select stable Rust
+        shell: pwsh
+        run: |
+          rustup update stable
+          rustup default stable
+      - name: Verify tag and Cargo version
+        shell: pwsh
+        run: |
+          $tag = "${{ github.ref_name }}"
+          $version = $tag.TrimStart('v')
+          $manifest = Get-Content Cargo.toml -Raw
+          $cargoVersion = [regex]::Match($manifest, '(?m)^version\s*=\s*"([^"]+)"').Groups[1].Value
+          if ($version -ne $cargoVersion) { throw "Tag $tag does not match Cargo version $cargoVersion" }
+          if (-not $env:ARC_LIVE_UPDATE_SIGNING_KEY) { throw 'ARC_LIVE_UPDATE_SIGNING_KEY is not configured' }
+      - name: Install WiX
+        shell: pwsh
+        run: |
+          dotnet tool install --global wix --version 5.0.2
+          wix extension add -g WixToolset.Bal.wixext/5.0.2
+      - name: Build installer and portable archive
+        shell: pwsh
+        run: |
+          $tag = "${{ github.ref_name }}"
+          $version = $tag.TrimStart('v')
+          $channel = if ($version.Contains('-')) { 'beta' } else { 'stable' }
+          $env:ARC_LIVE_UPDATE_FEED_URL = 'https://github.com/sokol-rc/ArcTwitchWidget/releases/latest/download/stable.json'
+          $env:ARC_LIVE_BETA_UPDATE_FEED_URL = 'https://github.com/sokol-rc/ArcTwitchWidget/releases/download/beta/beta.json'
+          $env:ARC_LIVE_INSTALLER_URL = "https://github.com/sokol-rc/ArcTwitchWidget/releases/download/$tag/ARC-Live-Setup-$version.exe"
+          ./scripts/build-installer.ps1 -UnsignedDevelopmentBuild -Channel $channel
+          cargo run -q -p arc-live-release-tool -- sign "dist/$channel.json" "dist/$channel.signed.json"
+          Move-Item -LiteralPath "dist/$channel.signed.json" -Destination "dist/$channel.json" -Force
+      - name: Publish GitHub release
+        shell: pwsh
+        run: |
+          $tag = "${{ github.ref_name }}"
+          $version = $tag.TrimStart('v')
+          $channel = if ($version.Contains('-')) { 'beta' } else { 'stable' }
+          $assets = @(
+            "dist/ARC-Live-Setup-$version.exe",
+            "dist/ARC-Live-$version-x64.msi",
+            "dist/ARC-Live-Portable-$version-windows-x64.zip",
+            "dist/$channel.json"
+          )
+          if ($channel -eq 'beta') {
+            gh release create $tag @assets --verify-tag --generate-notes --prerelease --title "ARC Live $version"
+            gh release view beta *> $null
+            if ($LASTEXITCODE -ne 0) {
+              gh release create beta --target $env:GITHUB_SHA --prerelease --title 'ARC Live beta channel' --notes 'Machine-readable pointer for the latest beta update manifest.'
+            }
+            gh release upload beta "dist/beta.json" --clobber
+          } else {
+            gh release create $tag @assets --verify-tag --generate-notes --latest --title "ARC Live $version"
+          }

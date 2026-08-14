@@ -1,0 +1,26 @@
+[package]
+name = "arc-live-capture-service"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "arc-live-capture-service"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+arc-live-collector = { path = "../collector" }
+crossbeam-channel.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+tracing.workspace = true
+tracing-appender.workspace = true
+tracing-subscriber.workspace = true
+zeroize.workspace = true
+
+[dev-dependencies]
+rand.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+windows-service.workspace = true

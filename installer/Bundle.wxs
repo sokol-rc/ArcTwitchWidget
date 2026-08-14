@@ -1,0 +1,19 @@
+<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs"
+     xmlns:bal="http://wixtoolset.org/schemas/v4/wxs/bal">
+  <Bundle
+      Name="ARC Live"
+      Manufacturer="ARC Live"
+      Version="$(var.ProductVersion)"
+      UpgradeCode="9DD54F6A-C513-4597-A0DD-D479D8D3082B">
+    <BootstrapperApplication>
+      <bal:WixStandardBootstrapperApplication
+          Theme="rtfLicense"
+          LicenseFile="$(var.ProjectDir)\installer\license.rtf"
+          LaunchTarget="[ProgramFiles64Folder]ARC Live\arc-live.exe"
+          SuppressOptionsUI="yes" />
+    </BootstrapperApplication>
+    <Chain>
+      <MsiPackage SourceFile="$(var.MsiPath)" Vital="yes" Visible="no" />
+    </Chain>
+  </Bundle>
+</Wix>
