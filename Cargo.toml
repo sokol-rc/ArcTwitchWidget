@@ -30,7 +30,7 @@ eframe = { version = "0.36.1", default-features = false, features = ["default_fo
 etherparse = "0.15"
 flate2 = "1.1"
 hex = "0.4"
-libloading = "0.8"
+libloading = "0.9"
 open = "5.4"
 pcapsql-core = { path = "vendor/pcapsql-core", default-features = false }
 rand = "0.9"
