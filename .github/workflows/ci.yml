@@ -1,0 +1,34 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Select stable Rust
+        shell: pwsh
+        run: |
+          rustup update stable
+          rustup default stable
+      - name: Check formatting
+        shell: pwsh
+        run: cargo fmt -p arc-live -p arc-live-capture -p arc-live-capture-service -p arc-live-collector -p arc-live-core -p arc-live-diagnostics -p arc-live-release-tool -p arc-live-storage -- --check
+      - name: Test workspace
+        shell: pwsh
+        run: cargo test --workspace --locked
+      - name: Lint application crates
+        shell: pwsh
+        run: cargo clippy -p arc-live -p arc-live-capture -p arc-live-capture-service -p arc-live-collector -p arc-live-core -p arc-live-diagnostics -p arc-live-release-tool -p arc-live-storage --all-targets --no-deps -- -D warnings

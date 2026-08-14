@@ -1,0 +1,105 @@
+{
+  "schema_version": 1,
+  "account": [
+    {
+      "source": "account.event.200.target.995408715",
+      "add": [],
+      "subtract": [],
+      "label_ru": "Ноки игроков",
+      "label_en": "Player knocks"
+    },
+    {
+      "source": "account.event.101",
+      "add": [],
+      "subtract": [
+        "account.event.101.target.995408715",
+        "account.event.101.target.200993951"
+      ],
+      "label_ru": "Урон рейдерам",
+      "label_en": "Raider damage"
+    },
+    {
+      "source": "account.loot_value",
+      "add": [],
+      "subtract": [],
+      "label_ru": "Вынесено",
+      "label_en": "Extracted value"
+    }
+  ],
+  "session": [
+    {
+      "source": "session.event.200.target.995408715",
+      "add": [],
+      "subtract": [],
+      "label_ru": "Ноки за стрим",
+      "label_en": "Stream knocks"
+    },
+    {
+      "source": "session.extractions",
+      "add": [],
+      "subtract": [],
+      "label_ru": "Успешные выходы",
+      "label_en": "Successful exits"
+    },
+    {
+      "source": "session.money_delta",
+      "add": [],
+      "subtract": [],
+      "label_ru": "Баланс",
+      "label_en": "Balance"
+    }
+  ],
+  "outcome": [
+    {
+      "source": "outcome.wins",
+      "add": [],
+      "subtract": [],
+      "label_ru": "Вышел живым",
+      "label_en": "Extracted alive"
+    },
+    {
+      "source": "outcome.losses",
+      "add": [],
+      "subtract": [],
+      "label_ru": "Погиб",
+      "label_en": "Knocked out"
+    }
+  ],
+  "pve": [
+    {
+      "source": "session.loot_value",
+      "add": [],
+      "subtract": [],
+      "label_ru": "Вынесено за стрим",
+      "label_en": "Stream loot"
+    },
+    {
+      "source": "session.event.101",
+      "add": [],
+      "subtract": [
+        "session.event.101.target.995408715",
+        "session.event.101.target.200993951"
+      ],
+      "label_ru": "Урон аркам",
+      "label_en": "ARC damage"
+    }
+  ],
+  "pvp": [
+    {
+      "source": "session.event.200.target.995408715",
+      "add": [],
+      "subtract": [],
+      "label_ru": "Ноки игроков",
+      "label_en": "Player knocks"
+    },
+    {
+      "source": "session.event.101.target.995408715",
+      "add": [
+        "session.event.101.target.200993951"
+      ],
+      "subtract": [],
+      "label_ru": "Урон игрокам",
+      "label_en": "Player damage"
+    }
+  ]
+}

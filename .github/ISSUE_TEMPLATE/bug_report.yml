@@ -1,0 +1,32 @@
+name: Bug report
+description: Report a reproducible ARC Live problem without attaching secrets.
+title: "[Bug]: "
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: Do not attach TLS keylogs, tokens, raw API responses, or private diagnostics.
+  - type: input
+    id: version
+    attributes:
+      label: ARC Live version
+      placeholder: 0.10.3
+    validations:
+      required: true
+  - type: textarea
+    id: problem
+    attributes:
+      label: What happened?
+      description: Describe the expected and actual result.
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Reproduction steps
+    validations:
+      required: true
+  - type: textarea
+    id: environment
+    attributes:
+      label: Windows, launcher, and OBS versions

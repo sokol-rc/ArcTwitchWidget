@@ -1,0 +1,42 @@
+[package]
+name = "arc-live"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+build = "build.rs"
+
+[[bin]]
+name = "arc-live"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+axum.workspace = true
+chrono.workspace = true
+crossbeam-channel.workspace = true
+base64.workspace = true
+ed25519-dalek.workspace = true
+eframe.workspace = true
+open.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-appender.workspace = true
+tracing-subscriber.workspace = true
+zip.workspace = true
+rand.workspace = true
+reqwest.workspace = true
+sha2.workspace = true
+arc-live-capture = { path = "../capture" }
+arc-live-collector = { path = "../collector" }
+arc-live-core = { path = "../core" }
+arc-live-diagnostics = { path = "../diagnostics" }
+arc-live-storage = { path = "../storage" }
+
+[target.'cfg(windows)'.dependencies]
+tray-icon = { version = "0.24.2", default-features = false }
+windows-sys.workspace = true
+
+[target.'cfg(windows)'.build-dependencies]
+embed-manifest = "1.5"

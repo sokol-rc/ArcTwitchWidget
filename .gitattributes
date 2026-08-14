@@ -1,0 +1,7 @@
+* text=auto eol=lf
+
+*.dll binary
+*.exe binary
+*.lib binary
+*.sys binary
+*.zip binary
