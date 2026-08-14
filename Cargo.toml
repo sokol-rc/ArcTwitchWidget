@@ -19,7 +19,7 @@ license = "MIT"
 [workspace.dependencies]
 anyhow = "1.0"
 axum = { version = "0.8.9", features = ["ws"] }
-base64 = "0.22"
+base64 = "0.23"
 brotli = "8.0"
 chrono = { version = "0.4", features = ["clock", "serde"] }
 compact_str = "0.8"
