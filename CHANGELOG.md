@@ -2,6 +2,17 @@
 
 All notable changes to ARC Live are documented here.
 
+## 0.13.0 — 2026-08-15
+
+- Reorganised the window around three tasks: Стрим, Виджет OBS and Настройки.
+- Added an always-visible OBS bar with the active preset and a one-click switch.
+- Moved the Browser Source address and appearance next to the widget preview.
+- Showed the current stream counters as numbers on the Стрим screen.
+- Switched the app to a dark theme that matches the OBS widget.
+- Fixed status and preset markers that rendered as empty boxes in the bundled font.
+- Fixed preset values that were invisible on the light background.
+- Extracted the rendering layer so screens can be reviewed without running the app.
+
 ## 0.12.0 — 2026-08-15
 
 - Replaced the five fixed widget modes with a user-defined preset list.

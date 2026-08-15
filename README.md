@@ -16,7 +16,7 @@ See the current production audit in
 ARC Live is a local-first Windows companion for discovering ARC Raiders raid
 telemetry and rendering normalized statistics in OBS Browser Sources.
 
-The current milestone is the **0.12 development build**. It configures a private TLS
+The current milestone is the **0.13 development build**. It configures a private TLS
 key log, exposes a localhost-only status/overlay server, stores sanitized
 observations in SQLite, and can export a diagnostic bundle that excludes TLS
 secrets. When the game returns to Speranza and requests player statistics, ARC
@@ -61,9 +61,10 @@ to lay out an OBS scene without launching the game.
 Widget presets are a user-editable list. ARC Live ships five (account totals,
 current stream, Win/Lose, fast PvE, fast PvP), and `widget-config.json` can add,
 rename, reorder or delete presets and choose from one to four values in each of
-them. The **Виджет OBS** screen lists every preset with its live values; one
-click switches the existing OBS Browser Source, and **Перезагрузить пресеты**
-picks up file edits without restarting. Switching a preset never resets the
+them. The **Виджет OBS** screen lists every preset with its live values next to a
+preview of the source, and **Перезагрузить пресеты** picks up file edits without
+restarting. A bar at the bottom of the window always shows which preset is on air
+and switches it from any screen. Switching a preset never resets the
 stream counters. An OBS source can override the selection with `?preset=<id>` or
 `?preset=<position>`. The app also switches the widget between Russian
 and English and controls its background opacity. Individual Browser Sources can

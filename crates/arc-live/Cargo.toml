@@ -34,6 +34,9 @@ arc-live-core = { path = "../core" }
 arc-live-diagnostics = { path = "../diagnostics" }
 arc-live-storage = { path = "../storage" }
 
+[dev-dependencies]
+png = "0.18"
+
 [target.'cfg(windows)'.dependencies]
 tray-icon = { version = "0.24.2", default-features = false }
 windows-sys.workspace = true

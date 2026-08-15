@@ -121,8 +121,22 @@ are data, not markup. Query overrides (`preset` as id or 1-based position, `lang
 string from Rust; when changing it, extract the `<script>` block and at least run
 `node --check` on it.
 
-**UI** is egui/eframe, single `ArcLiveApp` in `ui.rs` (Home / Widget / Settings
-pages plus onboarding), tray icon, Windows single-instance guard.
+**UI** is egui/eframe and split in two: `view.rs` (exported through `lib.rs`) is a
+pure renderer - it takes a read-only `ViewModel` and returns `Action`s, holding no
+app state - while `ui.rs` owns `ArcLiveApp`, builds the model, and applies the
+actions (tray, single-instance guard, onboarding stay there). Three pages: Стрим /
+Виджет OBS / Настройки, plus an always-visible bottom OBS bar. Keep new screens in
+`view.rs` so they stay screenshot-testable.
+
+**UI screenshots.** `cargo run --example ui_preview -- <dir>` renders every page
+with synthetic data and saves PNGs through `ViewportCommand::Screenshot`; no
+service, database or server involved. Use it to review layout changes instead of
+launching the app - the installed app holds a single-instance mutex, so a second
+copy just focuses the running window.
+
+Two font notes that already caused bugs: the bundled font has no `●`/`◉` glyphs
+(they render as empty boxes - paint circles instead), and the OBS widget's white
+`plain` values need the theme text color inside the app.
 
 ## Conventions and invariants
 

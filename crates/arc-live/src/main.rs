@@ -8,6 +8,7 @@ mod session_setup;
 mod single_instance;
 mod tray;
 mod ui;
+use arc_live::view;
 mod updates;
 
 use std::fs;
