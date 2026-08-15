@@ -119,6 +119,8 @@ pub enum Action {
     OpenObsPreview,
     OpenPresetFile,
     ReloadPresets,
+    /// Reread config.json and widget-config.json without restarting.
+    ReloadConfig,
     OpenDataFolder,
     ExportDiagnostics,
     SetLanguage(String),
@@ -950,7 +952,23 @@ fn settings_page(ui: &mut egui::Ui, model: &ViewModel<'_>, actions: &mut Vec<Act
             if ui.button("Файл пресетов").clicked() {
                 actions.push(Action::OpenPresetFile);
             }
+            if ui
+                .button("Применить правки файлов")
+                .on_hover_text(
+                    "Перечитывает config.json и widget-config.json и применяет всё, что можно \
+                     применить на ходу.",
+                )
+                .clicked()
+            {
+                actions.push(Action::ReloadConfig);
+            }
         });
+        ui.add_space(4.0);
+        ui.label(
+            RichText::new("Порт локального сервера меняется только при перезапуске приложения.")
+                .small()
+                .color(COLOR_MUTED),
+        );
     });
 
     section(ui, "О программе");

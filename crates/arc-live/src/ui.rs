@@ -309,6 +309,94 @@ impl ArcLiveApp {
         }
     }
 
+    /// Rereads both configuration files and applies everything that can change
+    /// at runtime, so editing a file does not require restarting the app.
+    fn reload_configuration(&mut self) {
+        let mut applied: Vec<&str> = Vec::new();
+        let mut needs_restart: Vec<&str> = Vec::new();
+
+        match AppConfig::load_or_create(&self.paths.config) {
+            Ok(config) => {
+                if config.local_port != self.config.local_port {
+                    needs_restart.push("порт локального сервера");
+                }
+                if config.game_process_names != self.config.game_process_names {
+                    self.process_monitor = ProcessMonitor::start(
+                        config.game_process_names.clone(),
+                        self.paths.sessions.join("arc-live-tls.keys"),
+                    );
+                    applied.push("список процессов игры");
+                }
+                let appearance_changed = config.overlay_language != self.config.overlay_language
+                    || config.overlay_background_preset != self.config.overlay_background_preset
+                    || config.overlay_background_color != self.config.overlay_background_color
+                    || config.overlay_opacity != self.config.overlay_opacity
+                    || config.overlay_blur != self.config.overlay_blur
+                    || config.overlay_preset != self.config.overlay_preset;
+                self.config = config;
+                if appearance_changed {
+                    let mut state = self.state.write().expect("state poisoned");
+                    state.overlay.language = self.config.overlay_language.clone();
+                    state.overlay.background_preset = self.config.overlay_background_preset.clone();
+                    state.overlay.background_color = self.config.overlay_background_color;
+                    state.overlay.opacity = self.config.overlay_opacity.min(100);
+                    state.overlay.background_blur = self.config.overlay_blur.min(20);
+                    if self.widget_config.contains(&self.config.overlay_preset) {
+                        state.overlay.preset = self.config.overlay_preset.clone();
+                    }
+                    applied.push("оформление виджета");
+                }
+                applied.push("настройки обновлений");
+            }
+            Err(error) => {
+                let message = format!("{error:#}");
+                self.state
+                    .write()
+                    .expect("state poisoned")
+                    .record("error", format!("Config reload failed: {message}"));
+                self.record_user_event("error", format!("config.json не принят: {message}"));
+                return;
+            }
+        }
+
+        match WidgetConfig::load_or_create(&self.paths.widget_config) {
+            Ok(config) => {
+                self.widget_config = config;
+                self.widget_config_error = None;
+                applied.push("пресеты виджета");
+            }
+            Err(error) => {
+                let message = format!("{error:#}");
+                self.widget_config_error = Some(message.clone());
+                self.record_user_event("error", format!("widget-config.json не принят: {message}"));
+            }
+        }
+
+        let updated = {
+            let mut state = self.state.write().expect("state poisoned");
+            self.widget_config.apply(&mut state.overlay);
+            state.record("info", "Configuration reloaded from disk");
+            state.clone()
+        };
+        self.server.notify(&updated);
+
+        let mut message = format!("Правки применены: {}", applied.join(", "));
+        if !needs_restart.is_empty() {
+            message.push_str(&format!(
+                ". Требует перезапуска: {}",
+                needs_restart.join(", ")
+            ));
+        }
+        self.record_user_event(
+            if needs_restart.is_empty() {
+                "success"
+            } else {
+                "warning"
+            },
+            message,
+        );
+    }
+
     fn drain_events(&mut self) {
         let mut changed = false;
         let collector_events = self.collector.events().clone();
@@ -690,6 +778,7 @@ impl ArcLiveApp {
                 let _ = open::that(&self.paths.widget_config);
             }
             Action::ReloadPresets => self.reload_widget_config(),
+            Action::ReloadConfig => self.reload_configuration(),
             Action::OpenDataFolder => {
                 let _ = open::that(&self.paths.root);
             }
