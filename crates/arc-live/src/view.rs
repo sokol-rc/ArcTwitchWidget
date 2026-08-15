@@ -4,7 +4,7 @@
 //! asked for, so the same code renders the real app and the offline
 //! `ui_preview` example used for design screenshots.
 
-use arc_live_core::state::{OverlayCell, OverlayPreset, OverlayStats};
+use arc_live_core::state::{GameKeylogStatus, OverlayCell, OverlayPreset, OverlayStats};
 use eframe::egui::{self, Color32, RichText};
 
 pub const COLOR_ACCENT: Color32 = Color32::from_rgb(83, 224, 161);
@@ -32,6 +32,44 @@ pub struct ConnectionView {
     pub stats_ready: bool,
     pub launcher_prepared: bool,
     pub service_privileged: bool,
+}
+
+/// Raw capture evidence, used to explain why nothing arrives.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct CaptureView {
+    pub handshakes: u64,
+    pub key_errors: u64,
+    pub decrypted: u64,
+    pub game_keylog: GameKeylogStatus,
+}
+
+/// Why the statistics are not arriving, in the order the user should act on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CaptureProblem {
+    /// The game runs without `SSLKEYLOGFILE` - its launcher predates the setup.
+    GameWithoutKeys,
+    /// The game writes keys to a file ARC Live does not read.
+    GameKeysElsewhere,
+    /// Handshakes are seen but no key matches them.
+    KeysDoNotMatch,
+}
+
+/// Decides what to tell the user. Pure so the rule stays testable.
+pub fn capture_problem(
+    connection: &ConnectionView,
+    capture: &CaptureView,
+) -> Option<CaptureProblem> {
+    if !connection.game_running || capture.decrypted > 0 {
+        return None;
+    }
+    match capture.game_keylog {
+        GameKeylogStatus::Missing => Some(CaptureProblem::GameWithoutKeys),
+        GameKeylogStatus::Different => Some(CaptureProblem::GameKeysElsewhere),
+        _ if capture.handshakes > 0 && capture.key_errors > 0 => {
+            Some(CaptureProblem::KeysDoNotMatch)
+        }
+        _ => None,
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -62,6 +100,7 @@ pub struct ViewModel<'a> {
     pub events: &'a [EventView],
     pub obs_url: &'a str,
     pub updates: UpdateView,
+    pub capture: CaptureView,
     pub preset_error: Option<&'a str>,
 }
 
@@ -305,26 +344,32 @@ fn section(ui: &mut egui::Ui, title: &str) {
 }
 
 fn stream_page(ui: &mut egui::Ui, model: &ViewModel<'_>, actions: &mut Vec<Action>) {
-    card(ui, |ui| {
-        let connection = &model.connection;
-        if connection.game_running && connection.stats_ready {
-            ui.label(RichText::new("Всё работает").size(19.0).strong());
-            ui.label("Статистика обновляется сама при каждом возвращении в Сперанцу.");
-        } else if connection.game_running {
-            ui.label(RichText::new("Подключаемся к игре…").size(19.0).strong());
-            ui.horizontal(|ui| {
-                ui.spinner();
-                ui.label("Обычно это занимает несколько секунд. Делать ничего не нужно.");
-            });
-        } else {
-            ui.label(
-                RichText::new("Можно запускать ARC Raiders")
-                    .size(19.0)
-                    .strong(),
-            );
-            ui.label("Запусти Steam или Epic и игру как обычно — ARC Live подключится сама.");
-        }
-    });
+    // A capture problem replaces the status card: telling the user that
+    // everything works right above the reason it does not would be a lie.
+    if let Some(problem) = capture_problem(&model.connection, &model.capture) {
+        capture_problem_card(ui, problem, &model.capture);
+    } else {
+        card(ui, |ui| {
+            let connection = &model.connection;
+            if connection.game_running && connection.stats_ready {
+                ui.label(RichText::new("Всё работает").size(19.0).strong());
+                ui.label("Статистика обновляется сама при каждом возвращении в Сперанцу.");
+            } else if connection.game_running {
+                ui.label(RichText::new("Подключаемся к игре…").size(19.0).strong());
+                ui.horizontal(|ui| {
+                    ui.spinner();
+                    ui.label("Обычно это занимает несколько секунд. Делать ничего не нужно.");
+                });
+            } else {
+                ui.label(
+                    RichText::new("Можно запускать ARC Raiders")
+                        .size(19.0)
+                        .strong(),
+                );
+                ui.label("Запусти Steam или Epic и игру как обычно — ARC Live подключится сама.");
+            }
+        });
+    }
 
     section(ui, "Текущий стрим");
     card(ui, |ui| {
@@ -437,6 +482,48 @@ fn stream_page(ui: &mut egui::Ui, model: &ViewModel<'_>, actions: &mut Vec<Actio
             actions.push(Action::ExportDiagnostics);
         }
     });
+}
+
+/// Explains a capture problem in the user's terms, with the exact next step.
+fn capture_problem_card(ui: &mut egui::Ui, problem: CaptureProblem, capture: &CaptureView) {
+    egui::Frame::group(ui.style())
+        .inner_margin(egui::Margin::same(16))
+        .corner_radius(egui::CornerRadius::same(10))
+        .fill(Color32::from_rgb(48, 30, 24))
+        .show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            let (title, explanation, step) = match problem {
+                CaptureProblem::GameWithoutKeys => (
+                    "Игра запущена без ключей шифрования",
+                    "ARC Live прочитала окружение игры: переменной SSLKEYLOGFILE там нет. Игра берёт её у лаунчера, а он был запущен раньше, чем ARC Live её установила.",
+                    "Полностью выйдите из Steam или Epic — через трей, а не просто закрыв окно, — затем перезагрузите Windows и запустите игру заново.",
+                ),
+                CaptureProblem::GameKeysElsewhere => (
+                    "Игра пишет ключи в другой файл",
+                    "У игры задан свой путь SSLKEYLOGFILE, и он не совпадает с файлом, который читает ARC Live.",
+                    "Уберите свою переменную SSLKEYLOGFILE, полностью выйдите из лаунчера и перезагрузите Windows — ARC Live пропишет свой путь сама.",
+                ),
+                CaptureProblem::KeysDoNotMatch => (
+                    "Ключи не подходят к соединениям игры",
+                    "Соединения с сервером статистики видны, но расшифровать их нечем: ключи в файле относятся к другим программам.",
+                    "Полностью выйдите из лаунчера, перезагрузите Windows и запустите игру заново.",
+                ),
+            };
+            ui.label(RichText::new(title).size(17.0).strong().color(COLOR_LOOT));
+            ui.add_space(4.0);
+            ui.label(explanation);
+            ui.add_space(6.0);
+            ui.label(RichText::new(step).strong());
+            ui.add_space(6.0);
+            ui.label(
+                RichText::new(format!(
+                    "Рукопожатий с сервером: {} · ключей не подошло: {} · расшифровано: {}",
+                    capture.handshakes, capture.key_errors, capture.decrypted
+                ))
+                .small()
+                .color(COLOR_MUTED),
+            );
+        });
 }
 
 fn stat(ui: &mut egui::Ui, label: &str, value: &str, color: Color32) {
@@ -888,4 +975,93 @@ pub fn demo_presets() -> Vec<OverlayPreset> {
             ],
         },
     ]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn connection(game_running: bool) -> ConnectionView {
+        ConnectionView {
+            game_running,
+            stats_ready: false,
+            launcher_prepared: true,
+            service_privileged: true,
+        }
+    }
+
+    #[test]
+    fn silent_while_the_game_is_not_running() {
+        let capture = CaptureView {
+            handshakes: 55,
+            key_errors: 55,
+            game_keylog: GameKeylogStatus::Missing,
+            ..Default::default()
+        };
+        assert_eq!(capture_problem(&connection(false), &capture), None);
+    }
+
+    #[test]
+    fn silent_once_anything_decrypts() {
+        let capture = CaptureView {
+            handshakes: 55,
+            key_errors: 12,
+            decrypted: 3,
+            game_keylog: GameKeylogStatus::Missing,
+        };
+        assert_eq!(capture_problem(&connection(true), &capture), None);
+    }
+
+    #[test]
+    fn game_without_the_variable_wins_over_the_generic_reason() {
+        let capture = CaptureView {
+            handshakes: 55,
+            key_errors: 55,
+            decrypted: 0,
+            game_keylog: GameKeylogStatus::Missing,
+        };
+        assert_eq!(
+            capture_problem(&connection(true), &capture),
+            Some(CaptureProblem::GameWithoutKeys)
+        );
+    }
+
+    #[test]
+    fn reports_a_foreign_keylog_path() {
+        let capture = CaptureView {
+            handshakes: 4,
+            key_errors: 4,
+            decrypted: 0,
+            game_keylog: GameKeylogStatus::Different,
+        };
+        assert_eq!(
+            capture_problem(&connection(true), &capture),
+            Some(CaptureProblem::GameKeysElsewhere)
+        );
+    }
+
+    /// The exact shape of the second diagnostics bundle: keys are present but
+    /// belong to other applications.
+    #[test]
+    fn handshakes_without_matching_keys_are_explained() {
+        let capture = CaptureView {
+            handshakes: 55,
+            key_errors: 55,
+            decrypted: 0,
+            game_keylog: GameKeylogStatus::Unknown,
+        };
+        assert_eq!(
+            capture_problem(&connection(true), &capture),
+            Some(CaptureProblem::KeysDoNotMatch)
+        );
+    }
+
+    #[test]
+    fn quiet_start_is_not_reported_as_a_problem() {
+        let capture = CaptureView {
+            game_keylog: GameKeylogStatus::Matches,
+            ..Default::default()
+        };
+        assert_eq!(capture_problem(&connection(true), &capture), None);
+    }
 }

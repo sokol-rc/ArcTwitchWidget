@@ -8,9 +8,10 @@
 use std::path::PathBuf;
 
 use arc_live::view::{
-    ConnectionView, EventView, Page, StreamView, UpdateView, ViewModel, demo_presets, render,
+    CaptureView, ConnectionView, EventView, Page, StreamView, UpdateView, ViewModel, demo_presets,
+    render,
 };
-use arc_live_core::state::OverlayStats;
+use arc_live_core::state::{GameKeylogStatus, OverlayStats};
 use eframe::egui;
 
 struct Preview {
@@ -52,6 +53,7 @@ fn main() -> eframe::Result<()> {
             (Page::Stream, "01-stream"),
             (Page::Widget, "02-widget"),
             (Page::Settings, "03-settings"),
+            (Page::Stream, "04-stream-no-keys"),
         ],
         index: 0,
         frames_on_page: 0,
@@ -106,7 +108,7 @@ impl eframe::App for Preview {
             overlay: &self.overlay,
             connection: ConnectionView {
                 game_running: true,
-                stats_ready: true,
+                stats_ready: name != "04-stream-no-keys",
                 launcher_prepared: true,
                 service_privileged: true,
             },
@@ -121,6 +123,21 @@ impl eframe::App for Preview {
                 automatic: true,
                 channel: "stable".to_owned(),
                 ..Default::default()
+            },
+            capture: if name == "04-stream-no-keys" {
+                CaptureView {
+                    handshakes: 55,
+                    key_errors: 55,
+                    decrypted: 0,
+                    game_keylog: GameKeylogStatus::Missing,
+                }
+            } else {
+                CaptureView {
+                    handshakes: 12,
+                    key_errors: 0,
+                    decrypted: 340,
+                    game_keylog: GameKeylogStatus::Matches,
+                }
             },
             preset_error: None,
         };

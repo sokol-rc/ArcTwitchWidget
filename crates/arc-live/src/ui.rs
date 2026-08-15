@@ -4,7 +4,7 @@ use std::time::Duration;
 use arc_live_collector::{CollectorEvent, ProbePayload};
 use arc_live_core::config::AppConfig;
 use arc_live_core::paths::AppPaths;
-use arc_live_core::state::{AppState, CollectorPhase, OverlayStats};
+use arc_live_core::state::{AppState, CollectorPhase, GameKeylogStatus, OverlayStats};
 use arc_live_core::widget_config::WidgetConfig;
 use arc_live_storage::{
     Observation, PersistedStreamSession, STREAM_SESSION_SCHEMA_VERSION, Storage, UserEvent,
@@ -19,7 +19,7 @@ use crate::single_instance::SingleInstanceGuard;
 use crate::tray::{TrayAction, TrayController};
 use crate::updates::UpdateManager;
 use crate::view::{
-    self, Action, ConnectionView, EventView, Page, StreamView, UpdateView, ViewModel,
+    self, Action, CaptureView, ConnectionView, EventView, Page, StreamView, UpdateView, ViewModel,
 };
 
 pub struct ArcLiveApp {
@@ -112,9 +112,13 @@ impl ArcLiveApp {
                 config.update_channel.clone(),
             );
         }
+        let paths_for_monitor = paths.sessions.join("arc-live-tls.keys");
         let mut app = Self {
             paths,
-            process_monitor: ProcessMonitor::start(config.game_process_names.clone()),
+            process_monitor: ProcessMonitor::start(
+                config.game_process_names.clone(),
+                paths_for_monitor,
+            ),
             config,
             widget_config,
             storage,
@@ -335,7 +339,10 @@ impl ArcLiveApp {
                     state.tcp_443_to_server = stats.tcp_443_to_server;
                     state.tcp_443_to_client = stats.tcp_443_to_client;
                     state.keylog_entries = stats.keylog_entries;
-                    if stats.keylog_entries > 0 {
+                    // Keys from other applications land in the same file, so only
+                    // a key that actually matched a captured handshake proves the
+                    // launcher passes the variable down to the game.
+                    if stats.tls_keys_established > 0 {
                         state.launcher_prepared = true;
                     }
                     state.tls_records = stats.tls_records;
@@ -404,11 +411,31 @@ impl ArcLiveApp {
             self.state.write().expect("state poisoned").last_update = Utc::now();
             changed = true;
         }
-        while let Ok(running) = self.process_monitor.changes.try_recv() {
+        while let Ok(status) = self.process_monitor.changes.try_recv() {
+            let running = status.running;
             let mut user_message = None;
             let mut overlay_to_persist = None;
             {
                 let mut state = self.state.write().expect("state poisoned");
+                if state.game_keylog != status.keylog {
+                    state.game_keylog = status.keylog;
+                    if status.keylog == GameKeylogStatus::Missing {
+                        state.record(
+                            "warning",
+                            "The running game has no SSLKEYLOGFILE; its launcher predates the setup",
+                        );
+                    }
+                    if let Some(path) = &status.keylog_path {
+                        state.record(
+                            "warning",
+                            format!(
+                                "The game writes TLS keys to another file: {}",
+                                path.display()
+                            ),
+                        );
+                    }
+                    changed = true;
+                }
                 if state.game_running != running {
                     state.game_running = running;
                     if running {
@@ -897,6 +924,12 @@ impl eframe::App for ArcLiveApp {
                     downloaded: self.updates.downloaded.is_some(),
                     blocked_by_game: snapshot.game_running,
                     error: self.updates.error.clone(),
+                },
+                capture: CaptureView {
+                    handshakes: snapshot.tls_server_hellos,
+                    key_errors: snapshot.tls_key_errors,
+                    decrypted: snapshot.decrypted_records,
+                    game_keylog: snapshot.game_keylog,
                 },
                 preset_error: self.widget_config_error.as_deref(),
             };

@@ -1,3 +1,14 @@
+/// Result of looking a variable up in another process.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct EnvironmentProbe {
+    /// How many matching processes were found.
+    pub processes: usize,
+    /// Whether at least one of them let us read its environment.
+    pub readable: bool,
+    /// The value, when it is set.
+    pub value: Option<String>,
+}
+
 #[cfg(windows)]
 mod windows {
     use std::ffi::c_void;
@@ -20,6 +31,29 @@ mod windows {
             .into_iter()
             .filter_map(|pid| environment_value(pid, variable).ok().flatten())
             .collect()
+    }
+
+    /// Same lookup, but keeps apart "the variable is not set" and "the process
+    /// would not let us read it". Anti-cheat protected games routinely refuse
+    /// the read, and reporting that as a missing variable would raise a false
+    /// alarm for people whose capture works fine.
+    pub fn environment_probe(process_name: &str, variable: &str) -> super::EnvironmentProbe {
+        let mut probe = super::EnvironmentProbe::default();
+        for pid in process_ids(process_name).unwrap_or_default() {
+            probe.processes += 1;
+            match environment_value(pid, variable) {
+                Ok(Some(value)) => {
+                    probe.readable = true;
+                    if !value.trim().is_empty() {
+                        probe.value = Some(value);
+                        return probe;
+                    }
+                }
+                Ok(None) => probe.readable = true,
+                Err(_) => {}
+            }
+        }
+        probe
     }
 
     fn process_ids(process_name: &str) -> Result<Vec<u32>> {
@@ -229,11 +263,16 @@ mod windows {
 }
 
 #[cfg(windows)]
-pub use windows::environment_values;
+pub use windows::{environment_probe, environment_values};
 
 #[cfg(not(windows))]
 pub fn environment_values(_process_name: &str, _variable: &str) -> Vec<String> {
     Vec::new()
+}
+
+#[cfg(not(windows))]
+pub fn environment_probe(_process_name: &str, _variable: &str) -> EnvironmentProbe {
+    EnvironmentProbe::default()
 }
 
 #[cfg(all(test, windows))]

@@ -3,6 +3,24 @@ use std::collections::{BTreeMap, VecDeque};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
+/// What the running game does with `SSLKEYLOGFILE`. Without keys from the game
+/// itself nothing can be decrypted, so this is the first thing to check when no
+/// statistics arrive.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GameKeylogStatus {
+    /// The game is not running, or its environment could not be read.
+    #[default]
+    Unknown,
+    /// The game runs without the variable - it inherited an environment from a
+    /// launcher that was started before ARC Live installed it.
+    Missing,
+    /// The game writes keys where ARC Live reads them.
+    Matches,
+    /// The game writes keys to a different file.
+    Different,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CollectorPhase {
@@ -177,6 +195,10 @@ pub struct AppState {
     pub database_ready: bool,
     pub launcher_prepared: bool,
     pub game_running: bool,
+    /// Whether the running game writes TLS keys where ARC Live reads them.
+    /// Only the verdict is published - never the path itself.
+    #[serde(default)]
+    pub game_keylog: GameKeylogStatus,
     pub stats_stream_ready: bool,
     pub packets_seen: u64,
     pub tcp_443_segments: u64,
@@ -215,6 +237,7 @@ impl AppState {
             database_ready: false,
             launcher_prepared: false,
             game_running: false,
+            game_keylog: GameKeylogStatus::Unknown,
             stats_stream_ready: false,
             packets_seen: 0,
             tcp_443_segments: 0,

@@ -2,6 +2,13 @@
 
 All notable changes to ARC Live are documented here.
 
+## 0.13.1 — 2026-08-15
+
+- Read `SSLKEYLOGFILE` from the running game and name the exact reason when statistics never arrive.
+- Explained a missing or foreign key file on the Стрим screen instead of showing an endless spinner.
+- Stopped reporting the launcher as ready when the key log only contains keys from other applications.
+- Kept quiet when the game refuses the environment read, so a working capture is never flagged.
+
 ## 0.13.0 — 2026-08-15
 
 - Reorganised the window around three tasks: Стрим, Виджет OBS and Настройки.
