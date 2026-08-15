@@ -16,7 +16,7 @@ See the current production audit in
 ARC Live is a local-first Windows companion for discovering ARC Raiders raid
 telemetry and rendering normalized statistics in OBS Browser Sources.
 
-The current milestone is the **0.11 development build**. It configures a private TLS
+The current milestone is the **0.12 development build**. It configures a private TLS
 key log, exposes a localhost-only status/overlay server, stores sanitized
 observations in SQLite, and can export a diagnostic bundle that excludes TLS
 secrets. When the game returns to Speranza and requests player statistics, ARC
@@ -58,11 +58,14 @@ selects a free loopback port, saves it, and shows the resulting URL in the app.
 Use **Show demo data** in the app
 to lay out an OBS scene without launching the game.
 
-The widget has five presets selectable in ARC Live: fast PvE (stream loot and
-ARC damage), fast PvP (player knocks and player damage), lifetime account
-totals, full current-stream statistics, and a compact Win/Lose counter. The two
-fast buttons on the Home screen switch the existing OBS Browser Source live.
-An OBS source can override the selected preset with `?preset=1..5`. The app also switches the widget between Russian
+Widget presets are a user-editable list. ARC Live ships five (account totals,
+current stream, Win/Lose, fast PvE, fast PvP), and `widget-config.json` can add,
+rename, reorder or delete presets and choose from one to four values in each of
+them. The **Виджет OBS** screen lists every preset with its live values; one
+click switches the existing OBS Browser Source, and **Перезагрузить пресеты**
+picks up file edits without restarting. Switching a preset never resets the
+stream counters. An OBS source can override the selection with `?preset=<id>` or
+`?preset=<position>`. The app also switches the widget between Russian
 and English and controls its background opacity. Individual Browser Sources can
 override those settings with `?lang=ru|en`, `?opacity=0..100`, `?bg=RRGGBB`,
 and `?blur=0..20`. The readable headerless Browser Source size is `700 × 80`.
@@ -74,17 +77,19 @@ The current stream baseline and latest calculated overlay are saved to SQLite
 after every native game statistics response. If ARC Live, ARC Raiders, Steam, or Windows is
 restarted, the app restores today's stream before reconnecting and continues
 from the same counters. The Home screen shows a short user-facing event history
-for the current day. `Сбросить статистику стрима` resets all PvE/PvP stream
-counters from one new baseline and requires confirmation. Switching presets
+for the current day. `Сбросить статистику стрима` resets the stream
+counters of every preset from one new baseline and requires confirmation. Switching presets
 never resets the counters.
 
 Every numeric `(eventId, targetId, amount)` aggregate returned by the player
 statistics endpoint is now retained in the local overlay snapshot under
 `raw_totals`; corresponding stream and daily deltas are exposed separately.
 The user-owned `%LOCALAPPDATA%\ArcLive\ARC Live\data\widget-config.json`
-selects which values and labels are shown in each widget slot. An adjacent
-configuration from an older/portable build is migrated automatically. ARC Live rereads the file on every successful sync,
-so field-mapping corrections no longer require a new executable. See
+defines the preset list itself: which values, labels and styles each preset
+shows. An adjacent configuration from an older/portable build is migrated
+automatically, and the pre-0.12 fixed layout is converted to the preset list on
+first start. ARC Live rereads the file on every successful sync and on demand,
+so preset changes no longer require a new executable. See
 [`docs/WIDGET_CONFIG_RU.md`](docs/WIDGET_CONFIG_RU.md).
 
 ARC Live automatically reuses TLS capture already enabled in a running Steam or
@@ -99,9 +104,9 @@ SNI and HTTP Host values. It passively reads the native
 Speranza. There is no timer, request replay, or extra call to Embark. Raw response
 values are never persisted. Only the JSON field/type shape and normalized
 aggregate totals are stored or published locally. The versioned
-`/api/v1/overlay` contract exposes both the five
-default overlay totals and additional known counters such as ARC eliminations,
-downs, revives, damage, duration, and XP.
+`/api/v1/overlay` contract (schema 7) exposes the resolved preset list plus
+named counters such as ARC eliminations, downs, revives, damage, duration, and
+XP.
 
 On first run, ARC Live creates `%LOCALAPPDATA%\ARC Live\config.json`. The local
 port, overlay dimensions, and candidate ARC Raiders process names can be

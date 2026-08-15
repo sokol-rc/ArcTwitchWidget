@@ -1,105 +1,144 @@
 {
-  "schema_version": 1,
-  "account": [
+  "schema_version": 2,
+  "presets": [
     {
-      "source": "account.event.200.target.995408715",
-      "add": [],
-      "subtract": [],
-      "label_ru": "Ноки игроков",
-      "label_en": "Player knocks"
+      "id": "account",
+      "name_ru": "Статистика аккаунта",
+      "name_en": "Account totals",
+      "cells": [
+        {
+          "source": "account.event.200.target.995408715",
+          "add": [],
+          "subtract": [],
+          "label_ru": "Ноки игроков",
+          "label_en": "Player knocks",
+          "style": "plain"
+        },
+        {
+          "source": "account.event.101",
+          "add": [],
+          "subtract": [
+            "account.event.101.target.995408715",
+            "account.event.101.target.200993951"
+          ],
+          "label_ru": "Урон рейдерам",
+          "label_en": "Raider damage",
+          "style": "accent"
+        },
+        {
+          "source": "account.loot_value",
+          "add": [],
+          "subtract": [],
+          "label_ru": "Вынесено",
+          "label_en": "Extracted value",
+          "style": "loot"
+        }
+      ]
     },
     {
-      "source": "account.event.101",
-      "add": [],
-      "subtract": [
-        "account.event.101.target.995408715",
-        "account.event.101.target.200993951"
-      ],
-      "label_ru": "Урон рейдерам",
-      "label_en": "Raider damage"
+      "id": "session",
+      "name_ru": "Текущий стрим",
+      "name_en": "Current stream",
+      "cells": [
+        {
+          "source": "session.event.200.target.995408715",
+          "add": [],
+          "subtract": [],
+          "label_ru": "Ноки за стрим",
+          "label_en": "Stream knocks",
+          "style": "plain"
+        },
+        {
+          "source": "session.extractions",
+          "add": [],
+          "subtract": [],
+          "label_ru": "Успешные выходы",
+          "label_en": "Successful exits",
+          "style": "accent"
+        },
+        {
+          "source": "session.money_delta",
+          "add": [],
+          "subtract": [],
+          "label_ru": "Баланс",
+          "label_en": "Balance",
+          "style": "balance"
+        }
+      ]
     },
     {
-      "source": "account.loot_value",
-      "add": [],
-      "subtract": [],
-      "label_ru": "Вынесено",
-      "label_en": "Extracted value"
-    }
-  ],
-  "session": [
-    {
-      "source": "session.event.200.target.995408715",
-      "add": [],
-      "subtract": [],
-      "label_ru": "Ноки за стрим",
-      "label_en": "Stream knocks"
+      "id": "outcome",
+      "name_ru": "Победы | Поражения",
+      "name_en": "Win | Lose",
+      "cells": [
+        {
+          "source": "outcome.wins",
+          "add": [],
+          "subtract": [],
+          "label_ru": "Вышел живым",
+          "label_en": "Extracted alive",
+          "style": "accent"
+        },
+        {
+          "source": "outcome.losses",
+          "add": [],
+          "subtract": [],
+          "label_ru": "Погиб",
+          "label_en": "Knocked out",
+          "style": "danger"
+        }
+      ]
     },
     {
-      "source": "session.extractions",
-      "add": [],
-      "subtract": [],
-      "label_ru": "Успешные выходы",
-      "label_en": "Successful exits"
+      "id": "pve",
+      "name_ru": "PvE · лут и ARC",
+      "name_en": "PvE · loot and ARC",
+      "cells": [
+        {
+          "source": "session.loot_value",
+          "add": [],
+          "subtract": [],
+          "label_ru": "Вынесено за стрим",
+          "label_en": "Stream loot",
+          "style": "loot"
+        },
+        {
+          "source": "session.event.101",
+          "add": [],
+          "subtract": [
+            "session.event.101.target.995408715",
+            "session.event.101.target.200993951"
+          ],
+          "label_ru": "Урон аркам",
+          "label_en": "ARC damage",
+          "style": "accent"
+        }
+      ]
     },
     {
-      "source": "session.money_delta",
-      "add": [],
-      "subtract": [],
-      "label_ru": "Баланс",
-      "label_en": "Balance"
-    }
-  ],
-  "outcome": [
-    {
-      "source": "outcome.wins",
-      "add": [],
-      "subtract": [],
-      "label_ru": "Вышел живым",
-      "label_en": "Extracted alive"
-    },
-    {
-      "source": "outcome.losses",
-      "add": [],
-      "subtract": [],
-      "label_ru": "Погиб",
-      "label_en": "Knocked out"
-    }
-  ],
-  "pve": [
-    {
-      "source": "session.loot_value",
-      "add": [],
-      "subtract": [],
-      "label_ru": "Вынесено за стрим",
-      "label_en": "Stream loot"
-    },
-    {
-      "source": "session.event.101",
-      "add": [],
-      "subtract": [
-        "session.event.101.target.995408715",
-        "session.event.101.target.200993951"
-      ],
-      "label_ru": "Урон аркам",
-      "label_en": "ARC damage"
-    }
-  ],
-  "pvp": [
-    {
-      "source": "session.event.200.target.995408715",
-      "add": [],
-      "subtract": [],
-      "label_ru": "Ноки игроков",
-      "label_en": "Player knocks"
-    },
-    {
-      "source": "session.event.101.target.995408715",
-      "add": [
-        "session.event.101.target.200993951"
-      ],
-      "subtract": [],
-      "label_ru": "Урон игрокам",
-      "label_en": "Player damage"
+      "id": "pvp",
+      "name_ru": "PvP · ноки и урон",
+      "name_en": "PvP · knocks and damage",
+      "cells": [
+        {
+          "source": "session.event.200.target.995408715",
+          "add": [],
+          "subtract": [],
+          "label_ru": "Ноки игроков",
+          "label_en": "Player knocks",
+          "style": "plain"
+        },
+        {
+          "source": "session.event.101.target.995408715",
+          "add": [
+            "session.event.101.target.200993951"
+          ],
+          "subtract": [],
+          "label_ru": "Урон игрокам",
+          "label_en": "Player damage",
+          "style": "danger"
+        }
+      ]
     }
   ]
 }

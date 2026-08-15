@@ -4,7 +4,7 @@ use std::time::Duration;
 use arc_live_collector::{CollectorEvent, ProbePayload};
 use arc_live_core::config::AppConfig;
 use arc_live_core::paths::AppPaths;
-use arc_live_core::state::{AppState, CollectorPhase, OverlayStats};
+use arc_live_core::state::{AppState, CollectorPhase, OverlayCell, OverlayStats};
 use arc_live_core::widget_config::WidgetConfig;
 use arc_live_storage::{
     Observation, PersistedStreamSession, STREAM_SESSION_SCHEMA_VERSION, Storage, UserEvent,
@@ -45,6 +45,7 @@ pub struct ArcLiveApp {
     stream_started_at: Option<DateTime<Utc>>,
     user_events: Vec<UserEvent>,
     last_sync_succeeded: bool,
+    widget_config_error: Option<String>,
     confirm_new_stream: bool,
     onboarding_step: usize,
     page: AppPage,
@@ -133,6 +134,7 @@ impl ArcLiveApp {
             stream_started_at,
             user_events,
             last_sync_succeeded: false,
+            widget_config_error: None,
             confirm_new_stream: false,
             onboarding_step: 0,
             page: AppPage::Home,
@@ -257,7 +259,7 @@ impl ArcLiveApp {
     }
 
     fn select_overlay_preset(&mut self, preset: &str) {
-        if !matches!(preset, "account" | "session" | "outcome" | "pve" | "pvp") {
+        if !self.widget_config.contains(preset) {
             return;
         }
         let (updated, overlay) = {
@@ -271,6 +273,35 @@ impl ArcLiveApp {
         };
         self.server.notify(&updated);
         self.save_overlay_preferences(&overlay);
+    }
+
+    /// Rereads widget-config.json on demand so preset edits show up without
+    /// waiting for the next game synchronization.
+    fn reload_widget_config(&mut self) {
+        match WidgetConfig::load_or_create(&self.paths.widget_config) {
+            Ok(config) => {
+                self.widget_config = config;
+                self.widget_config_error = None;
+                let updated = {
+                    let mut state = self.state.write().expect("state poisoned");
+                    self.widget_config.apply(&mut state.overlay);
+                    state.record("info", "Widget presets reloaded from disk");
+                    state.clone()
+                };
+                let overlay = updated.overlay.clone();
+                self.server.notify(&updated);
+                self.save_overlay_preferences(&overlay);
+                self.record_user_event("success", "Пресеты перечитаны из файла");
+            }
+            Err(error) => {
+                let message = format!("{error:#}");
+                self.state
+                    .write()
+                    .expect("state poisoned")
+                    .record("error", format!("Widget config reload failed: {message}"));
+                self.widget_config_error = Some(message);
+            }
+        }
     }
 
     fn drain_events(&mut self) {
@@ -443,12 +474,18 @@ impl ArcLiveApp {
             .expect("session baseline initialized");
         overlay.apply_session_baseline(baseline);
         match WidgetConfig::load_or_create(&self.paths.widget_config) {
-            Ok(config) => self.widget_config = config,
-            Err(error) => self
-                .state
-                .write()
-                .expect("state poisoned")
-                .record("error", format!("Widget config reload failed: {error:#}")),
+            Ok(config) => {
+                self.widget_config = config;
+                self.widget_config_error = None;
+            }
+            Err(error) => {
+                let message = format!("{error:#}");
+                self.state
+                    .write()
+                    .expect("state poisoned")
+                    .record("error", format!("Widget config reload failed: {message}"));
+                self.widget_config_error = Some(message);
+            }
         }
         self.widget_config.apply(&mut overlay);
         {
@@ -604,331 +641,25 @@ impl ArcLiveApp {
 }
 
 #[allow(dead_code)]
-impl ArcLiveApp {
-    fn ui(&mut self, root: &mut egui::Ui, _frame: &mut eframe::Frame) {
-        while self.instance.activation.try_recv().is_ok() {
-            root.ctx()
-                .send_viewport_cmd(egui::ViewportCommand::Visible(true));
-            root.ctx().send_viewport_cmd(egui::ViewportCommand::Focus);
-        }
-        self.drain_events();
-        root.ctx()
-            .request_repaint_after(std::time::Duration::from_millis(250));
-        let snapshot = self.state.read().expect("state poisoned").clone();
+const COLOR_ACCENT: Color32 = Color32::from_rgb(83, 224, 161);
+const COLOR_DANGER: Color32 = Color32::from_rgb(255, 112, 124);
+const COLOR_LOOT: Color32 = Color32::from_rgb(246, 183, 60);
 
-        egui::CentralPanel::default().show(root, |ui| {
-            ui.heading(RichText::new("ARC Live").size(32.0).strong());
-            ui.label(RichText::new("Independent live statistics for OBS").color(Color32::GRAY));
-            ui.add_space(12.0);
-
-            egui::Frame::group(ui.style()).show(ui, |ui| {
-                ui.horizontal(|ui| {
-                    ui.label(RichText::new(format!("{:?}", snapshot.phase)).strong());
-                    if snapshot.stats_stream_ready { ui.colored_label(Color32::from_rgb(83, 224, 161), "Regional stats stream ready"); }
-                    else { ui.colored_label(Color32::from_rgb(246, 183, 60), "Waiting for token"); }
-                });
-                ui.separator();
-                ui.columns(3, |columns| {
-                    columns[0].label("Captured packets"); columns[0].heading(snapshot.packets_seen.to_string());
-                    columns[1].label("Decrypted records"); columns[1].heading(snapshot.decrypted_records.to_string());
-                    columns[2].label("Observations"); columns[2].heading(snapshot.observations.to_string());
-                });
-                ui.separator();
-                ui.label(format!(
-                    "TCP 443: {}  |  Keylog: {}  |  TLS handshakes: {}/{}  |  Key errors: {}  |  Decrypt errors: {}",
-                    snapshot.tcp_443_segments,
-                    snapshot.keylog_entries,
-                    snapshot.tls_client_hellos,
-                    snapshot.tls_server_hellos,
-                    snapshot.tls_key_errors,
-                    snapshot.tls_decrypt_errors,
-                ));
-                ui.label(format!(
-                    "Direction TCP out/in: {}/{}  |  TLS out/in: {}/{}  |  ClientHello with key: {}  |  Embark: {}",
-                    snapshot.tcp_443_to_server,
-                    snapshot.tcp_443_to_client,
-                    snapshot.tls_records_to_server,
-                    snapshot.tls_records_to_client,
-                    snapshot.tls_client_hellos_with_keys,
-                    snapshot.last_embark_sni.as_deref().unwrap_or("not seen"),
-                ));
-            });
-
-            ui.add_space(12.0);
-            ui.heading("1. Automatic connection");
-            ui.label("ARC Live attaches automatically. It never closes or restarts Steam, Epic, or ARC Raiders.");
-            if snapshot.launcher_prepared {
-                ui.colored_label(Color32::from_rgb(83, 224, 161), "Running launcher is ready");
+/// Renders one preset value exactly the way the OBS widget renders it.
+fn cell_text(cell: &OverlayCell) -> (String, Color32) {
+    match cell.style.as_str() {
+        "balance" => (
+            grouped_signed(cell.value),
+            if cell.value < 0 {
+                COLOR_DANGER
             } else {
-                ui.colored_label(Color32::from_rgb(246, 183, 60), "One-time setup is installed. It will activate after Steam or Epic next starts normally.");
-            }
-
-            ui.add_space(12.0);
-            ui.heading("2. OBS preview");
-            let overlay_url = format!("{}/overlay/live", snapshot.local_url);
-            ui.horizontal(|ui| {
-                ui.monospace(&overlay_url);
-                if ui.button("Open preview").clicked() { let _ = open::that(&overlay_url); }
-            });
-            ui.horizontal(|ui| {
-                if ui.button("Load demo stats").clicked() {
-                    let updated = {
-                        let mut state = self.state.write().expect("state poisoned");
-                        state.overlay.mode = "demo".to_owned();
-                        state.overlay.raids = 12;
-                        state.overlay.extractions = 7;
-                        state.overlay.eliminations = 19;
-                        state.overlay.deaths = 5;
-                        state.overlay.loot_value = 428_750;
-                        state.overlay.arc_eliminations = 146;
-                        state.overlay.downs = 24;
-                        state.overlay.revives = 8;
-                        state.overlay.containers_looted = 317;
-                        state.overlay.items_crafted = 64;
-                        state.overlay.damage_by_enemy = 37_420;
-                        state.overlay.damage_by_weapon = 91_680;
-                        state.overlay.raider_damage = 28_640;
-                        state.overlay.duration_ms = 4_327_000;
-                        state.overlay.value_brought_in = 184_500;
-                        state.overlay.xp_gained = 38_740;
-                        state.overlay.stats_rows = 1_587;
-                        state.overlay.session_downs = 6;
-                        state.overlay.session_extractions = 3;
-                        state.overlay.session_deaths = 2;
-                        state.overlay.session_loot_value = 128_400;
-                        state.overlay.session_money_delta = -56_100;
-                        state.overlay.today_extractions = 5;
-                        state.overlay.today_deaths = 3;
-                        state.overlay.today_available = true;
-                        state.overlay.session_raw_totals.insert(
-                            "event.200.target.995408715".into(),
-                            6,
-                        );
-                        state
-                            .overlay
-                            .session_raw_totals
-                            .insert("event.101".into(), 55_600);
-                        state.overlay.session_raw_totals.insert(
-                            "event.101.target.995408715".into(),
-                            18_700,
-                        );
-                        state.overlay.session_raw_totals.insert(
-                            "event.101.target.200993951".into(),
-                            900,
-                        );
-                        self.widget_config.apply(&mut state.overlay);
-                        state.record("info", "OBS demo statistics loaded");
-                        state.clone()
-                    };
-                    self.server.notify(&updated);
-                }
-                if snapshot.overlay.mode == "demo" && ui.button("Clear demo").clicked() {
-                    let updated = {
-                        let mut state = self.state.write().expect("state poisoned");
-                        let preset = state.overlay.preset.clone();
-                        let language = state.overlay.language.clone();
-                        let opacity = state.overlay.opacity;
-                        let background_preset = state.overlay.background_preset.clone();
-                        let background_color = state.overlay.background_color;
-                        let background_blur = state.overlay.background_blur;
-                        state.overlay = Default::default();
-                        state.overlay.mode = "live".to_owned();
-                        state.overlay.preset = preset;
-                        state.overlay.language = language;
-                        state.overlay.opacity = opacity;
-                        state.overlay.background_preset = background_preset;
-                        state.overlay.background_color = background_color;
-                        state.overlay.background_blur = background_blur;
-                        state.record("info", "OBS demo statistics cleared");
-                        state.clone()
-                    };
-                    self.server.notify(&updated);
-                }
-                if snapshot.overlay.mode == "demo" && ui.button("Demo balance + / -").clicked() {
-                    let updated = {
-                        let mut state = self.state.write().expect("state poisoned");
-                        state.overlay.session_money_delta =
-                            if state.overlay.session_money_delta < 0 {
-                                72_300
-                            } else {
-                                -56_100
-                            };
-                        state.record("info", "OBS demo balance sign changed");
-                        state.clone()
-                    };
-                    self.server.notify(&updated);
-                }
-                ui.label("Use this to design the OBS scene before a real raid.");
-            });
-            let mut selected_preset = snapshot.overlay.preset.clone();
-            ui.horizontal_wrapped(|ui| {
-                ui.label("Widget preset:");
-                ui.selectable_value(&mut selected_preset, "pve".to_owned(), "PvE");
-                ui.selectable_value(&mut selected_preset, "pvp".to_owned(), "PvP");
-                ui.selectable_value(
-                    &mut selected_preset,
-                    "account".to_owned(),
-                    "1 · Account totals",
-                );
-                ui.selectable_value(
-                    &mut selected_preset,
-                    "session".to_owned(),
-                    "2 · Since app launch",
-                );
-                ui.selectable_value(
-                    &mut selected_preset,
-                    "outcome".to_owned(),
-                    "3 · Win | Lose",
-                );
-            });
-            if selected_preset != snapshot.overlay.preset {
-                self.select_overlay_preset(&selected_preset);
-            }
-            let mut selected_language = snapshot.overlay.language.clone();
-            let mut selected_opacity = snapshot.overlay.opacity;
-            let mut selected_background_preset = snapshot.overlay.background_preset.clone();
-            let mut selected_background_color = snapshot.overlay.background_color;
-            let mut selected_background_blur = snapshot.overlay.background_blur;
-            ui.horizontal_wrapped(|ui| {
-                ui.label("Язык виджета:");
-                ui.selectable_value(&mut selected_language, "ru".to_owned(), "Русский");
-                ui.selectable_value(&mut selected_language, "en".to_owned(), "English");
-            });
-            ui.horizontal_wrapped(|ui| {
-                ui.label("Быстрый фон:");
-                ui.selectable_value(
-                    &mut selected_background_preset,
-                    "transparent".to_owned(),
-                    "Прозрачный",
-                );
-                ui.selectable_value(
-                    &mut selected_background_preset,
-                    "smoke".to_owned(),
-                    "Дым",
-                );
-                ui.selectable_value(
-                    &mut selected_background_preset,
-                    "glass".to_owned(),
-                    "Стекло",
-                );
-                ui.selectable_value(
-                    &mut selected_background_preset,
-                    "solid".to_owned(),
-                    "Плотный",
-                );
-                ui.selectable_value(
-                    &mut selected_background_preset,
-                    "custom".to_owned(),
-                    "Свой",
-                );
-            });
-            if selected_background_preset != snapshot.overlay.background_preset {
-                match selected_background_preset.as_str() {
-                    "transparent" => {
-                        selected_background_color = [9, 16, 21];
-                        selected_opacity = 0;
-                        selected_background_blur = 0;
-                    }
-                    "glass" => {
-                        selected_background_color = [16, 30, 36];
-                        selected_opacity = 32;
-                        selected_background_blur = 12;
-                    }
-                    "solid" => {
-                        selected_background_color = [8, 12, 15];
-                        selected_opacity = 82;
-                        selected_background_blur = 0;
-                    }
-                    "custom" => {}
-                    _ => {
-                        selected_background_preset = "smoke".to_owned();
-                        selected_background_color = [9, 16, 21];
-                        selected_opacity = 48;
-                        selected_background_blur = 4;
-                    }
-                }
-            }
-            let mut manual_background_change = false;
-            ui.horizontal_wrapped(|ui| {
-                ui.label("Свой фон:");
-                manual_background_change |= ui
-                    .color_edit_button_srgb(&mut selected_background_color)
-                    .changed();
-                ui.label("Непрозрачность:");
-                manual_background_change |= ui
-                    .add(egui::Slider::new(&mut selected_opacity, 0..=100).suffix("%"))
-                    .changed();
-                ui.label("Размытие:");
-                manual_background_change |= ui
-                    .add(
-                        egui::Slider::new(&mut selected_background_blur, 0..=20)
-                            .suffix(" px"),
-                    )
-                    .changed();
-            });
-            if manual_background_change {
-                selected_background_preset = "custom".to_owned();
-            }
-            if selected_language != snapshot.overlay.language
-                || selected_opacity != snapshot.overlay.opacity
-                || selected_background_preset != snapshot.overlay.background_preset
-                || selected_background_color != snapshot.overlay.background_color
-                || selected_background_blur != snapshot.overlay.background_blur
-            {
-                let updated = {
-                    let mut state = self.state.write().expect("state poisoned");
-                    state.overlay.language = selected_language;
-                    state.overlay.opacity = selected_opacity;
-                    state.overlay.background_preset = selected_background_preset;
-                    state.overlay.background_color = selected_background_color;
-                    state.overlay.background_blur = selected_background_blur;
-                    state.record("info", "OBS widget appearance changed");
-                    state.clone()
-                };
-                self.server.notify(&updated);
-            }
-
-            ui.add_space(12.0);
-            ui.heading("3. Автоматическая статистика");
-            ui.label("ARC Live ждёт штатный ответ игры со статистикой. Игра отправляет его при возвращении в Сперанцу, поэтому таймера и дополнительных запросов к Embark больше нет.");
-            let ready = self.collector_ready;
-            if ready {
-                ui.colored_label(Color32::from_rgb(83, 224, 161), "Региональный поток статистики найден");
-            }
-            if snapshot.stats_stream_ready && !self.collector_ready {
-                ui.label("Waiting for the game's regional player-stats response...");
-            }
-            if snapshot.overlay.stats_rows > 0 {
-                ui.label(format!(
-                    "OBS data: {} raids, {} extracts, {} PvP eliminations, {} loot value ({} source rows)",
-                    snapshot.overlay.raids,
-                    snapshot.overlay.extractions,
-                    snapshot.overlay.eliminations,
-                    snapshot.overlay.loot_value,
-                    snapshot.overlay.stats_rows,
-                ));
-            }
-
-            ui.add_space(12.0);
-            ui.heading("4. After one raid");
-            if ui.button("Export sanitized diagnostics").clicked() {
-                match arc_live_diagnostics::export(&self.paths, &snapshot, &self.storage) {
-                    Ok(path) => { self.state.write().expect("state poisoned").record("success", format!("Diagnostics exported: {}", path.display())); let _ = open::that(path.parent().unwrap_or(&path)); }
-                    Err(error) => self.state.write().expect("state poisoned").record("error", format!("Diagnostics export failed: {error:#}")),
-                }
-            }
-
-            ui.add_space(12.0);
-            ui.heading("Activity");
-            egui::ScrollArea::vertical().max_height(240.0).show(ui, |ui| {
-                for item in &snapshot.activity {
-                    ui.horizontal_wrapped(|ui| {
-                        ui.monospace(item.at.format("%H:%M:%S").to_string());
-                        ui.label(&item.message);
-                    });
-                }
-            });
-        });
+                COLOR_ACCENT
+            },
+        ),
+        "accent" => (grouped_metric(cell.value), COLOR_ACCENT),
+        "danger" => (grouped_metric(cell.value), COLOR_DANGER),
+        "loot" => (grouped_metric(cell.value), COLOR_LOOT),
+        _ => (grouped_metric(cell.value), Color32::WHITE),
     }
 }
 
@@ -962,6 +693,13 @@ fn grouped_metric(value: i64) -> String {
 
 impl eframe::App for ArcLiveApp {
     fn ui(&mut self, root: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        // A second launch hands activation to the running instance instead of
+        // starting a new one; bring the window back to the front.
+        while self.instance.activation.try_recv().is_ok() {
+            root.ctx()
+                .send_viewport_cmd(egui::ViewportCommand::Visible(true));
+            root.ctx().send_viewport_cmd(egui::ViewportCommand::Focus);
+        }
         if let Some(action) = self.tray.as_ref().and_then(TrayController::poll) {
             match action {
                 TrayAction::Show => {
@@ -1054,18 +792,21 @@ impl eframe::App for ArcLiveApp {
                     ui.add_space(14.0);
                     ui.heading("Текущий стрим");
                     let mut quick_preset = snapshot.overlay.preset.clone();
+                    let language = snapshot.overlay.language.clone();
                     ui.horizontal_wrapped(|ui| {
-                        ui.label("Режим в OBS:");
-                        ui.selectable_value(
-                            &mut quick_preset,
-                            "pve".to_owned(),
-                            RichText::new("PvE · лут и ARC").size(16.0).strong(),
-                        );
-                        ui.selectable_value(
-                            &mut quick_preset,
-                            "pvp".to_owned(),
-                            RichText::new("PvP · ноки и урон").size(16.0).strong(),
-                        );
+                        ui.label("Пресет в OBS:");
+                        for preset in &snapshot.overlay.presets {
+                            ui.selectable_value(
+                                &mut quick_preset,
+                                preset.id.clone(),
+                                RichText::new(preset.name(&language)).size(15.0).strong(),
+                            );
+                        }
+                    });
+                    ui.horizontal_wrapped(|ui| {
+                        if ui.button("Все пресеты").clicked() {
+                            self.page = AppPage::Widget;
+                        }
                         ui.separator();
                         let can_reset = snapshot.overlay.stats_rows > 0
                             && snapshot.overlay.mode != "demo";
@@ -1103,7 +844,9 @@ impl eframe::App for ArcLiveApp {
                         egui::Frame::group(ui.style())
                             .inner_margin(egui::Margin::same(12))
                             .show(ui, |ui| {
-                                ui.label("Обнулить PvE- и PvP-статистику текущего стрима?");
+                                ui.label(
+                                    "Обнулить статистику текущего стрима? Она обнулится сразу во всех пресетах.",
+                                );
                                 ui.horizontal(|ui| {
                                     if ui.button("Да, сбросить").clicked() {
                                         self.start_new_stream();
@@ -1185,134 +928,115 @@ impl eframe::App for ArcLiveApp {
                     });
                 }
                 AppPage::Widget => {
-                    ui.heading("Живое превью");
                     let overlay = &snapshot.overlay;
-                    let russian = overlay.language != "en";
-                    let mut preview_metrics: Vec<(String, String, Color32)> = Vec::new();
-                    match overlay.preset.as_str() {
-                        "pve" => {
-                            preview_metrics.push((
-                                grouped_metric(overlay.widget_pve[0]),
-                                if russian {
-                                    overlay.widget_pve_labels_ru[0].clone()
-                                } else {
-                                    overlay.widget_pve_labels_en[0].clone()
-                                },
-                                Color32::from_rgb(246, 183, 60),
-                            ));
-                            preview_metrics.push((
-                                grouped_metric(overlay.widget_pve[1]),
-                                if russian {
-                                    overlay.widget_pve_labels_ru[1].clone()
-                                } else {
-                                    overlay.widget_pve_labels_en[1].clone()
-                                },
-                                Color32::from_rgb(83, 224, 161),
-                            ));
-                        }
-                        "pvp" => {
-                            preview_metrics.push((
-                                grouped_metric(overlay.widget_pvp[0]),
-                                if russian {
-                                    overlay.widget_pvp_labels_ru[0].clone()
-                                } else {
-                                    overlay.widget_pvp_labels_en[0].clone()
-                                },
-                                Color32::WHITE,
-                            ));
-                            preview_metrics.push((
-                                grouped_metric(overlay.widget_pvp[1]),
-                                if russian {
-                                    overlay.widget_pvp_labels_ru[1].clone()
-                                } else {
-                                    overlay.widget_pvp_labels_en[1].clone()
-                                },
-                                Color32::from_rgb(255, 112, 124),
-                            ));
-                        }
-                        "session" => {
-                            preview_metrics.push((
-                                grouped_metric(overlay.widget_session[0]),
-                                if russian {
-                                    overlay.widget_session_labels_ru[0].clone()
-                                } else {
-                                    overlay.widget_session_labels_en[0].clone()
-                                },
-                                Color32::WHITE,
-                            ));
-                            preview_metrics.push((
-                                grouped_metric(overlay.widget_session[1]),
-                                if russian {
-                                    overlay.widget_session_labels_ru[1].clone()
-                                } else {
-                                    overlay.widget_session_labels_en[1].clone()
-                                },
-                                Color32::from_rgb(83, 224, 161),
-                            ));
-                            preview_metrics.push((
-                                grouped_signed(overlay.widget_session[2]),
-                                if russian {
-                                    overlay.widget_session_labels_ru[2].clone()
-                                } else {
-                                    overlay.widget_session_labels_en[2].clone()
-                                },
-                                if overlay.widget_session[2] < 0 {
-                                    Color32::from_rgb(255, 112, 124)
-                                } else {
-                                    Color32::from_rgb(83, 224, 161)
-                                },
-                            ));
-                        }
-                        "outcome" => {
-                            preview_metrics.push((
-                                grouped_metric(overlay.widget_outcome[0]),
-                                if russian {
-                                    overlay.widget_outcome_labels_ru[0].clone()
-                                } else {
-                                    overlay.widget_outcome_labels_en[0].clone()
-                                },
-                                Color32::from_rgb(83, 224, 161),
-                            ));
-                            preview_metrics.push((
-                                grouped_metric(overlay.widget_outcome[1]),
-                                if russian {
-                                    overlay.widget_outcome_labels_ru[1].clone()
-                                } else {
-                                    overlay.widget_outcome_labels_en[1].clone()
-                                },
-                                Color32::from_rgb(255, 112, 124),
-                            ));
-                        }
-                        _ => {
-                            preview_metrics.push((
-                                grouped_metric(overlay.widget_account[0]),
-                                if russian {
-                                    overlay.widget_account_labels_ru[0].clone()
-                                } else {
-                                    overlay.widget_account_labels_en[0].clone()
-                                },
-                                Color32::WHITE,
-                            ));
-                            preview_metrics.push((
-                                grouped_metric(overlay.widget_account[1]),
-                                if russian {
-                                    overlay.widget_account_labels_ru[1].clone()
-                                } else {
-                                    overlay.widget_account_labels_en[1].clone()
-                                },
-                                Color32::from_rgb(83, 224, 161),
-                            ));
-                            preview_metrics.push((
-                                grouped_metric(overlay.widget_account[2]),
-                                if russian {
-                                    overlay.widget_account_labels_ru[2].clone()
-                                } else {
-                                    overlay.widget_account_labels_en[2].clone()
-                                },
-                                Color32::from_rgb(246, 183, 60),
-                            ));
-                        }
+                    let language = overlay.language.clone();
+                    let mut edited = overlay.clone();
+
+                    ui.heading("Пресеты виджета");
+                    ui.label(
+                        RichText::new(
+                            "Выбери, что показывать в OBS. Переключение применяется сразу, счётчики стрима не сбрасываются.",
+                        )
+                        .color(Color32::GRAY),
+                    );
+                    if let Some(error) = self.widget_config_error.clone() {
+                        egui::Frame::group(ui.style())
+                            .inner_margin(egui::Margin::same(10))
+                            .show(ui, |ui| {
+                                ui.colored_label(
+                                    COLOR_DANGER,
+                                    "Файл пресетов повреждён — работает последняя рабочая версия",
+                                );
+                                ui.label(RichText::new(error).color(Color32::GRAY));
+                            });
                     }
+                    ui.add_space(8.0);
+
+                    let mut chosen = overlay.preset.clone();
+                    egui::ScrollArea::vertical()
+                        .max_height(260.0)
+                        .id_salt("preset-list")
+                        .show(ui, |ui| {
+                            for preset in &overlay.presets {
+                                let selected = preset.id == overlay.preset;
+                                let row = egui::Frame::group(ui.style())
+                                    .inner_margin(egui::Margin::same(10))
+                                    .fill(if selected {
+                                        ui.style().visuals.selection.bg_fill.gamma_multiply(0.35)
+                                    } else {
+                                        Color32::TRANSPARENT
+                                    })
+                                    .show(ui, |ui| {
+                                        ui.set_width(ui.available_width());
+                                        ui.horizontal(|ui| {
+                                            ui.label(if selected { "◉" } else { "◯" });
+                                            ui.label(
+                                                RichText::new(preset.name(&language))
+                                                    .size(16.0)
+                                                    .strong(),
+                                            );
+                                            ui.label(
+                                                RichText::new(format!("id: {}", preset.id))
+                                                    .small()
+                                                    .color(Color32::GRAY),
+                                            );
+                                        });
+                                        ui.horizontal_wrapped(|ui| {
+                                            for cell in &preset.cells {
+                                                let (value, color) = cell_text(cell);
+                                                ui.label(RichText::new(value).size(15.0).strong().color(color));
+                                                ui.label(
+                                                    RichText::new(cell.label(&language))
+                                                        .small()
+                                                        .color(Color32::LIGHT_GRAY),
+                                                );
+                                                ui.add_space(10.0);
+                                            }
+                                        });
+                                    })
+                                    .response
+                                    .interact(egui::Sense::click())
+                                    .on_hover_cursor(egui::CursorIcon::PointingHand);
+                                if row.clicked() {
+                                    chosen = preset.id.clone();
+                                }
+                            }
+                        });
+                    if chosen != overlay.preset {
+                        self.select_overlay_preset(&chosen);
+                    }
+
+                    ui.add_space(8.0);
+                    ui.horizontal_wrapped(|ui| {
+                        if ui.button("Открыть файл пресетов").clicked() {
+                            let _ = open::that(&self.paths.widget_config);
+                        }
+                        if ui.button("Перезагрузить пресеты").clicked() {
+                            self.reload_widget_config();
+                        }
+                        ui.label(
+                            RichText::new(
+                                "В файле можно добавлять свои пресеты, менять числа и подписи — перезапуск не нужен.",
+                            )
+                            .color(Color32::GRAY),
+                        );
+                    });
+
+                    ui.add_space(14.0);
+                    ui.heading("Живое превью");
+                    let preview_metrics: Vec<(String, String, Color32)> = overlay
+                        .active_preset()
+                        .map(|preset| {
+                            preset
+                                .cells
+                                .iter()
+                                .map(|cell| {
+                                    let (value, color) = cell_text(cell);
+                                    (value, cell.label(&language).to_owned(), color)
+                                })
+                                .collect()
+                        })
+                        .unwrap_or_default();
 
                     let [red, green, blue] = overlay.background_color;
                     let preview_background = Color32::from_rgba_unmultiplied(
@@ -1327,38 +1051,30 @@ impl eframe::App for ArcLiveApp {
                         .corner_radius(egui::CornerRadius::same(8))
                         .inner_margin(egui::Margin::same(10))
                         .show(ui, |ui| {
-                            let preview_top = ui.cursor().top();
+                            if preview_metrics.is_empty() {
+                                ui.label(
+                                    RichText::new("В файле пресетов нет ни одного показателя")
+                                        .color(Color32::GRAY),
+                                );
+                                return;
+                            }
                             ui.columns(preview_metrics.len(), |columns| {
                                 for (column, (value, label, color)) in
                                     columns.iter_mut().zip(preview_metrics.iter())
                                 {
-                                    column.label(RichText::new(value).size(29.0).strong().color(*color));
-                                    column.label(RichText::new(label).size(11.0).color(Color32::LIGHT_GRAY));
+                                    column.label(
+                                        RichText::new(value).size(29.0).strong().color(*color),
+                                    );
+                                    column.label(
+                                        RichText::new(label).size(11.0).color(Color32::LIGHT_GRAY),
+                                    );
                                 }
                             });
-                            if preview_metrics.len() == 2 {
-                                let rect = ui.min_rect();
-                                ui.painter().line_segment(
-                                    [
-                                        egui::pos2(rect.center().x, preview_top),
-                                        egui::pos2(rect.center().x, rect.bottom()),
-                                    ],
-                                    egui::Stroke::new(1.0, Color32::from_white_alpha(45)),
-                                );
-                            }
                         });
 
-                    ui.add_space(14.0);
-                    ui.heading("Что показывать");
-                    let mut edited = overlay.clone();
+                    ui.add_space(12.0);
                     ui.horizontal_wrapped(|ui| {
-                        ui.selectable_value(&mut edited.preset, "pve".to_owned(), "PvE");
-                        ui.selectable_value(&mut edited.preset, "pvp".to_owned(), "PvP");
-                        ui.separator();
-                        ui.selectable_value(&mut edited.preset, "account".to_owned(), "Аккаунт");
-                        ui.selectable_value(&mut edited.preset, "session".to_owned(), "Весь стрим");
-                        ui.selectable_value(&mut edited.preset, "outcome".to_owned(), "Win | Lose");
-                        ui.separator();
+                        ui.label("Язык виджета:");
                         ui.selectable_value(&mut edited.language, "ru".to_owned(), "Русский");
                         ui.selectable_value(&mut edited.language, "en".to_owned(), "English");
                     });
@@ -1435,8 +1151,9 @@ impl eframe::App for ArcLiveApp {
                         edited.background_preset = "custom".to_owned();
                     }
 
-                    let appearance_changed = edited.preset != overlay.preset
-                        || edited.language != overlay.language
+                    // The preset itself is switched by the list above, so only
+                    // appearance is written back here.
+                    let appearance_changed = edited.language != overlay.language
                         || edited.background_preset != overlay.background_preset
                         || edited.background_color != overlay.background_color
                         || edited.opacity != overlay.opacity
@@ -1444,7 +1161,7 @@ impl eframe::App for ArcLiveApp {
                     if appearance_changed {
                         let updated = {
                             let mut state = self.state.write().expect("state poisoned");
-                            state.overlay.preset = edited.preset.clone();
+                            edited.preset = state.overlay.preset.clone();
                             state.overlay.language = edited.language.clone();
                             state.overlay.background_preset = edited.background_preset.clone();
                             state.overlay.background_color = edited.background_color;
@@ -1560,17 +1277,6 @@ impl eframe::App for ArcLiveApp {
                             let _ = open::that(&overlay_url);
                         }
                         ui.label(RichText::new("Изменения сохраняются автоматически").color(Color32::GRAY));
-                    });
-                    ui.add_space(8.0);
-                    ui.collapsing("Расширенная настройка данных", |ui| {
-                        ui.label("Источники чисел и подписи задаются в пользовательском файле конфигурации.");
-                        if ui.button("Открыть widget-config.json").clicked() {
-                            let _ = open::that(&self.paths.widget_config);
-                        }
-                        ui.label(
-                            RichText::new("Исправления применяются при следующей синхронизации — новый EXE не нужен.")
-                                .color(Color32::GRAY),
-                        );
                     });
                 }
                 AppPage::Settings => {

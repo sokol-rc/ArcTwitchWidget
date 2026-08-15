@@ -22,6 +22,49 @@ pub struct ActivityItem {
     pub message: String,
 }
 
+/// One value rendered in a widget preset cell.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct OverlayCell {
+    pub value: i64,
+    pub label_ru: String,
+    pub label_en: String,
+    /// Rendering hint: `plain`, `accent`, `danger`, `loot` or `balance`.
+    /// `balance` renders an explicit sign and colors by sign.
+    pub style: String,
+}
+
+/// A user-defined widget layout. The list comes from `widget-config.json`, so
+/// presets can be added, removed and renamed without a new executable.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct OverlayPreset {
+    pub id: String,
+    pub name_ru: String,
+    pub name_en: String,
+    pub cells: Vec<OverlayCell>,
+}
+
+impl OverlayPreset {
+    pub fn name(&self, language: &str) -> &str {
+        if language == "en" {
+            &self.name_en
+        } else {
+            &self.name_ru
+        }
+    }
+}
+
+impl OverlayCell {
+    pub fn label(&self, language: &str) -> &str {
+        if language == "en" {
+            &self.label_en
+        } else {
+            &self.label_ru
+        }
+    }
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct OverlayStats {
@@ -62,25 +105,21 @@ pub struct OverlayStats {
     pub raw_totals: BTreeMap<String, u64>,
     pub session_raw_totals: BTreeMap<String, u64>,
     pub today_raw_totals: BTreeMap<String, u64>,
-    /// Values selected by the adjacent widget-config.json file.
-    pub widget_account: [i64; 3],
-    pub widget_session: [i64; 3],
-    pub widget_outcome: [i64; 2],
-    pub widget_pve: [i64; 2],
-    pub widget_pvp: [i64; 2],
-    pub widget_account_labels_ru: [String; 3],
-    pub widget_account_labels_en: [String; 3],
-    pub widget_session_labels_ru: [String; 3],
-    pub widget_session_labels_en: [String; 3],
-    pub widget_outcome_labels_ru: [String; 2],
-    pub widget_outcome_labels_en: [String; 2],
-    pub widget_pve_labels_ru: [String; 2],
-    pub widget_pve_labels_en: [String; 2],
-    pub widget_pvp_labels_ru: [String; 2],
-    pub widget_pvp_labels_en: [String; 2],
+    /// Every preset defined in widget-config.json, already resolved to numbers.
+    /// The overlay renders `preset`; the others are shipped so a Browser Source
+    /// can override the selection with `?preset=`.
+    pub presets: Vec<OverlayPreset>,
 }
 
 impl OverlayStats {
+    /// The preset the widget is currently rendering.
+    pub fn active_preset(&self) -> Option<&OverlayPreset> {
+        self.presets
+            .iter()
+            .find(|preset| preset.id == self.preset)
+            .or_else(|| self.presets.first())
+    }
+
     pub fn apply_session_baseline(&mut self, baseline: &Self) {
         self.session_downs = self.downs.saturating_sub(baseline.downs);
         self.session_extractions = self.extractions.saturating_sub(baseline.extractions);
@@ -226,7 +265,7 @@ impl AppState {
 
     pub fn overlay_snapshot(&self) -> OverlaySnapshot {
         OverlaySnapshot {
-            schema_version: 6,
+            schema_version: 7,
             updated_at: self.last_update,
             game_running: self.game_running,
             stats: self.overlay.clone(),
@@ -242,7 +281,7 @@ mod tests {
     fn overlay_contract_is_versioned() {
         let state = AppState::new("test", "private.keys");
         let value = serde_json::to_value(state.overlay_snapshot()).unwrap();
-        assert_eq!(value["schema_version"], 6);
+        assert_eq!(value["schema_version"], 7);
         assert!(value["stats"].get("raids").is_some());
         assert!(value["stats"].get("xp_gained").is_some());
         assert_eq!(value["stats"]["preset"], "account");
@@ -254,7 +293,49 @@ mod tests {
             serde_json::json!([9, 16, 21])
         );
         assert_eq!(value["stats"]["background_blur"], 6);
+        assert!(value["stats"]["presets"].is_array());
         assert!(value.get("keylog_path").is_none());
+    }
+
+    #[test]
+    fn active_preset_falls_back_to_the_first_entry() {
+        let mut stats = OverlayStats {
+            preset: "gone".to_owned(),
+            ..Default::default()
+        };
+        assert!(stats.active_preset().is_none());
+        stats.presets = vec![
+            OverlayPreset {
+                id: "first".to_owned(),
+                ..Default::default()
+            },
+            OverlayPreset {
+                id: "second".to_owned(),
+                ..Default::default()
+            },
+        ];
+        assert_eq!(stats.active_preset().unwrap().id, "first");
+        stats.preset = "second".to_owned();
+        assert_eq!(stats.active_preset().unwrap().id, "second");
+    }
+
+    #[test]
+    fn preset_and_cell_labels_follow_the_widget_language() {
+        let preset = OverlayPreset {
+            id: "pve".to_owned(),
+            name_ru: "PvE".to_owned(),
+            name_en: "PvE mode".to_owned(),
+            cells: vec![OverlayCell {
+                value: 5,
+                label_ru: "Лут".to_owned(),
+                label_en: "Loot".to_owned(),
+                style: "loot".to_owned(),
+            }],
+        };
+        assert_eq!(preset.name("ru"), "PvE");
+        assert_eq!(preset.name("en"), "PvE mode");
+        assert_eq!(preset.cells[0].label("ru"), "Лут");
+        assert_eq!(preset.cells[0].label("en"), "Loot");
     }
 
     #[test]

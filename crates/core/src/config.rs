@@ -97,12 +97,11 @@ impl AppConfig {
             self.overlay_height >= 60,
             "overlay_height must be at least 60"
         );
+        // Preset ids come from the user's widget-config.json, so only the shape
+        // is validated here; a missing id falls back to the first preset.
         ensure!(
-            matches!(
-                self.overlay_preset.as_str(),
-                "account" | "session" | "outcome" | "pve" | "pvp"
-            ),
-            "overlay_preset is invalid"
+            !self.overlay_preset.trim().is_empty(),
+            "overlay_preset is empty"
         );
         ensure!(
             matches!(self.overlay_language.as_str(), "ru" | "en"),

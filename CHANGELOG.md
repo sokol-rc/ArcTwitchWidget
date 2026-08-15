@@ -2,6 +2,16 @@
 
 All notable changes to ARC Live are documented here.
 
+## 0.12.0 — 2026-08-15
+
+- Replaced the five fixed widget modes with a user-defined preset list.
+- Added a preset screen that shows every preset with its live values and switches OBS in one click.
+- Added on-demand preset reloading and a visible reason when the preset file is rejected.
+- Allowed one to four values per preset, up to twelve presets, and per-value color styles.
+- Converted existing `widget-config.json` files to the preset list automatically.
+- Published overlay contract schema 7 with a resolved `presets` array.
+- Restored window activation when ARC Live is started a second time.
+
 ## 0.11.0 — 2026-08-14
 
 - Added one-click PvE and PvP preset switching on the Home screen.

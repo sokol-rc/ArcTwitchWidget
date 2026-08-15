@@ -14,16 +14,16 @@ changed in `%LOCALAPPDATA%\ARC Live\config.json`.
 - `GET /overlay/live` — production stats Browser Source.
 - `GET /overlay/discovery` — collector diagnostics Browser Source.
 
-## Overlay schema v6
+## Overlay schema v7
 
 ```json
 {
-  "schema_version": 6,
-  "updated_at": "2026-08-13T20:00:00Z",
+  "schema_version": 7,
+  "updated_at": "2026-08-15T20:00:00Z",
   "game_running": true,
   "stats": {
     "mode": "live",
-    "preset": "account",
+    "preset": "pve",
     "language": "ru",
     "opacity": 55,
     "background_preset": "smoke",
@@ -60,19 +60,39 @@ changed in `%LOCALAPPDATA%\ARC Live\config.json`.
     },
     "session_raw_totals": {},
     "today_raw_totals": {},
-    "widget_account": [123, 4444, 0],
-    "widget_session": [0, 0, 0],
-    "widget_outcome": [0, 0],
-    "widget_pve": [0, 0],
-    "widget_pvp": [0, 0]
+    "presets": [
+      {
+        "id": "pve",
+        "name_ru": "PvE · лут и ARC",
+        "name_en": "PvE · loot and ARC",
+        "cells": [
+          {"value": 125000, "label_ru": "Вынесено за стрим",
+           "label_en": "Stream loot", "style": "loot"},
+          {"value": 33000, "label_ru": "Урон аркам",
+           "label_en": "ARC damage", "style": "accent"}
+        ]
+      }
+    ]
   }
 }
 ```
 
-Existing field names and types remain compatible. The numeric event aggregates
-are exposed so `widget-config.json` can select them; the raw Embark payload,
-credentials, and account identifiers are not served. `/overlay/live` accepts
-optional query parameters for a specific Browser Source: `preset=1..5`
-(`4` is PvE and `5` is PvP),
-`lang=ru|en`, `opacity=0..100`, `bg=RRGGBB`, and `blur=0..20`. These override
-the selections made in the desktop app.
+### Что изменилось в v7
+
+Фиксированные поля `widget_account`, `widget_session`, `widget_outcome`,
+`widget_pve`, `widget_pvp` и десять массивов `widget_*_labels_*` заменены одним
+массивом `presets`. Каждый пресет описан в пользовательском
+`widget-config.json`, поэтому их число, имена и количество показателей задаёт
+пользователь, а не сборка. `preset` содержит `id` активного пресета.
+
+`style` показателя - подсказка отрисовки: `plain`, `accent` (зелёный),
+`danger` (красный), `loot` (жёлтый) и `balance` (знак `+`/`−` и цвет по знаку).
+
+Именованные агрегаты (`raids`, `loot_value`, `raw_totals` и прочие) не менялись.
+Сырой ответ Embark, credentials и идентификаторы аккаунта по-прежнему не
+публикуются.
+
+`/overlay/live` принимает необязательные параметры для конкретного Browser
+Source: `preset=<id>` либо `preset=<номер от 1>` в порядке из файла,
+`lang=ru|en`, `opacity=0..100`, `bg=RRGGBB` и `blur=0..20`. Они перекрывают
+выбор, сделанный в приложении.
