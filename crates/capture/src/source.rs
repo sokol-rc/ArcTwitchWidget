@@ -11,6 +11,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::Result;
 
+use crate::etw::{RawCapture as EtwCapture, RawCaptureControl as EtwControl};
 use crate::raw::{RawCapture as DivertCapture, RawCaptureControl as DivertControl};
 use crate::rawsock::{RawCapture as SocketCapture, RawCaptureControl as SocketControl};
 
@@ -20,10 +21,26 @@ const VALIDATION_WINDOW: Duration = Duration::from_secs(6);
 
 /// True as soon as one packet arrives *towards* this host, which is what the
 /// decryption needs and what a broken raw socket never produces.
-fn delivers_inbound(capture: &mut SocketCapture, window: Duration) -> bool {
+trait Probeable {
+    fn poll(&mut self) -> Result<Option<&[u8]>>;
+}
+
+impl Probeable for SocketCapture {
+    fn poll(&mut self) -> Result<Option<&[u8]>> {
+        self.next_packet()
+    }
+}
+
+impl Probeable for EtwCapture {
+    fn poll(&mut self) -> Result<Option<&[u8]>> {
+        self.next_packet()
+    }
+}
+
+fn delivers_inbound<S: Probeable>(capture: &mut S, window: Duration) -> bool {
     let deadline = Instant::now() + window;
     while Instant::now() < deadline {
-        match capture.next_packet() {
+        match capture.poll() {
             Ok(Some(packet)) => {
                 if let Some(segment) = crate::packet::parse_ipv4_tcp(0, 0, packet)
                     && segment.src_port == 443
@@ -40,6 +57,8 @@ fn delivers_inbound(capture: &mut SocketCapture, window: Duration) -> bool {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Backend {
+    /// The packet-capture provider built into Windows.
+    Etw,
     RawSocket,
     WinDivert,
 }
@@ -47,6 +66,7 @@ pub enum Backend {
 impl Backend {
     pub fn as_str(self) -> &'static str {
         match self {
+            Self::Etw => "Windows packet capture",
             Self::RawSocket => "raw socket",
             Self::WinDivert => "WinDivert",
         }
@@ -59,6 +79,7 @@ pub fn preference(raw: Option<&str>) -> Option<Backend> {
         .map(|value| value.trim().to_ascii_lowercase())
         .as_deref()
     {
+        Some("etw" | "ndis" | "pktmon") => Some(Backend::Etw),
         Some("rawsocket" | "raw" | "socket") => Some(Backend::RawSocket),
         Some("windivert" | "divert" | "driver") => Some(Backend::WinDivert),
         _ => None,
@@ -66,12 +87,14 @@ pub fn preference(raw: Option<&str>) -> Option<Backend> {
 }
 
 pub enum PacketSource {
+    Etw(EtwCapture),
     RawSocket(SocketCapture),
     WinDivert(DivertCapture),
 }
 
 #[derive(Clone)]
 pub enum SourceControl {
+    Etw(EtwControl),
     RawSocket(SocketControl),
     WinDivert(DivertControl),
 }
@@ -79,6 +102,7 @@ pub enum SourceControl {
 impl SourceControl {
     pub fn shutdown(&self) {
         match self {
+            Self::Etw(control) => control.shutdown(),
             Self::RawSocket(control) => control.shutdown(),
             Self::WinDivert(control) => control.shutdown(),
         }
@@ -101,6 +125,15 @@ impl PacketSource {
                     None,
                 ))
             }
+            Some(Backend::Etw) => {
+                let (capture, control) = EtwCapture::open()?;
+                Ok((
+                    Self::Etw(capture),
+                    SourceControl::Etw(control),
+                    Backend::Etw,
+                    None,
+                ))
+            }
             Some(Backend::RawSocket) => {
                 let (capture, control) = SocketCapture::open()?;
                 Ok((
@@ -111,6 +144,20 @@ impl PacketSource {
                 ))
             }
             None => {
+                // Preferred: the capture provider that ships with Windows. It
+                // needs no third-party driver and was the only source that
+                // delivered both directions on every machine tested.
+                if let Ok((mut capture, control)) = EtwCapture::open() {
+                    if delivers_inbound(&mut capture, VALIDATION_WINDOW) {
+                        return Ok((
+                            Self::Etw(capture),
+                            SourceControl::Etw(control),
+                            Backend::Etw,
+                            None,
+                        ));
+                    }
+                    control.shutdown();
+                }
                 // The raw socket opens fine on machines where it then delivers
                 // outbound traffic only - measured on a host with Hyper-V and
                 // WSL virtual adapters. Without inbound packets there is no
@@ -146,6 +193,7 @@ impl PacketSource {
 
     pub fn next_packet(&mut self) -> Result<Option<&[u8]>> {
         match self {
+            Self::Etw(capture) => capture.next_packet(),
             Self::RawSocket(capture) => capture.next_packet(),
             Self::WinDivert(capture) => capture.next_packet(),
         }
@@ -158,7 +206,7 @@ impl PacketSource {
             Self::RawSocket(capture) => capture.oversized_packets,
             #[cfg(not(windows))]
             Self::RawSocket(_) => 0,
-            Self::WinDivert(_) => 0,
+            Self::Etw(_) | Self::WinDivert(_) => 0,
         }
     }
 }
@@ -169,6 +217,7 @@ mod tests {
 
     #[test]
     fn backend_preference_is_read_from_the_environment() {
+        assert_eq!(preference(Some("etw")), Some(Backend::Etw));
         assert_eq!(preference(Some("rawsocket")), Some(Backend::RawSocket));
         assert_eq!(preference(Some(" WinDivert ")), Some(Backend::WinDivert));
         assert_eq!(preference(Some("auto")), None);

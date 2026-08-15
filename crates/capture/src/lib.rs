@@ -1,3 +1,4 @@
+pub(crate) mod etw;
 pub(crate) mod packet;
 mod raw;
 mod rawsock;
@@ -69,13 +70,13 @@ pub fn probe_packet_source(seconds: u64) -> anyhow::Result<String> {
     }
     control.shutdown();
 
-    let driver_free = backend == source::Backend::RawSocket;
+    let driver_free = matches!(backend, source::Backend::RawSocket | source::Backend::Etw);
     let verdict = match (outbound, inbound) {
         (0, 0) => "трафик на 443 не пойман вообще.",
         (_, 0) => "видны только ИСХОДЯЩИЕ — нет ServerHello, ключи не установить.",
         (0, _) => "видны только ВХОДЯЩИЕ — нет ClientHello, ключи не сопоставить.",
-        _ if driver_free => "ОБЕ стороны видны на raw-сокете — драйвер не нужен.",
-        _ => "ОБЕ стороны видны, но через драйвер: raw-сокет здесь не подошёл.",
+        _ if driver_free => "ОБЕ стороны видны — сторонний драйвер не нужен.",
+        _ => "ОБЕ стороны видны, но через WinDivert: встроенные источники здесь не подошли.",
     };
     Ok(format!(
         "движок: {} (режим RCVALL: {})\nинтерфейсы: {addresses}\nпакетов всего: {packets}\nTCP 443 исходящих: {outbound} (из них ClientHello: {client_hellos})\nTCP 443 входящих: {inbound} (из них ServerHello: {server_hellos})\nпо адресам: от нас {from_me}, к нам {to_me}\nкрупных пакетов потеряно: {}\nзапасной движок: {}\nВЫВОД: {verdict}",
