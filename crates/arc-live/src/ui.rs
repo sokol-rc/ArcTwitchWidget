@@ -15,6 +15,7 @@ use eframe::egui::{self, Color32, RichText};
 use crate::process_monitor::ProcessMonitor;
 use crate::server::ServerHandle;
 use crate::service_client::CollectorRuntime;
+use crate::session_setup;
 use crate::single_instance::SingleInstanceGuard;
 use crate::tray::{TrayAction, TrayController};
 use crate::updates::UpdateManager;
@@ -42,6 +43,7 @@ pub struct ArcLiveApp {
     user_events: Vec<UserEvent>,
     last_sync_succeeded: bool,
     widget_config_error: Option<String>,
+    launchers: Vec<(session_setup::Launcher, std::path::PathBuf)>,
     confirm_new_stream: bool,
     onboarding_step: usize,
     page: Page,
@@ -136,6 +138,7 @@ impl ArcLiveApp {
             user_events,
             last_sync_succeeded: false,
             widget_config_error: None,
+            launchers: session_setup::installed_launchers(),
             confirm_new_stream: false,
             onboarding_step: 0,
             page: Page::Stream,
@@ -362,6 +365,8 @@ impl ArcLiveApp {
                     state.active_capture_connections = stats.active_connections;
                     state.capture_buffered_bytes = stats.buffered_bytes;
                     state.capture_connections_evicted = stats.connections_evicted;
+                    state.capture_backend = stats.capture_backend.clone();
+                    state.oversized_packets = stats.oversized_packets;
                 }
                 CollectorEvent::Ready { stats_stream_ready } => {
                     self.collector_ready = stats_stream_ready;
@@ -734,6 +739,38 @@ impl ArcLiveApp {
                 self.updates.check(feed, self.config.update_channel.clone());
             }
             Action::DownloadUpdate => self.updates.download(self.paths.updates.clone()),
+            Action::RestartLauncher(index) => {
+                let Some((launcher, executable)) = self.launchers.get(index).cloned() else {
+                    return;
+                };
+                let keylog = self.paths.sessions.join("arc-live-tls.keys");
+                match session_setup::restart_launcher_with_keylog(launcher, &executable, &keylog) {
+                    Ok(()) => {
+                        self.state.write().expect("state poisoned").record(
+                            "success",
+                            format!("{} restarted with the key log variable", launcher.title()),
+                        );
+                        self.record_user_event(
+                            "success",
+                            format!(
+                                "{} перезапущен — теперь можно запускать игру",
+                                launcher.title()
+                            ),
+                        );
+                    }
+                    Err(error) => {
+                        let message = format!("{error:#}");
+                        self.state
+                            .write()
+                            .expect("state poisoned")
+                            .record("error", format!("Launcher restart failed: {message}"));
+                        self.record_user_event(
+                            "error",
+                            format!("Не удалось перезапустить {}: {message}", launcher.title()),
+                        );
+                    }
+                }
+            }
             Action::InstallUpdate => match self.updates.launch_downloaded_after_exit() {
                 Ok(()) => ctx.send_viewport_cmd(egui::ViewportCommand::Close),
                 Err(error) => self.updates.error = Some(format!("{error:#}")),
@@ -889,10 +926,16 @@ impl eframe::App for ArcLiveApp {
             })
             .collect();
         let overlay_url = format!("{}/overlay/live", snapshot.local_url);
+        let launcher_titles: Vec<String> = self
+            .launchers
+            .iter()
+            .map(|(launcher, _)| launcher.title().to_owned())
+            .collect();
         let actions = {
             let model = ViewModel {
                 page: self.page,
                 version: env!("CARGO_PKG_VERSION"),
+                capture_backend: &snapshot.capture_backend,
                 overlay: &snapshot.overlay,
                 connection: ConnectionView {
                     game_running: snapshot.game_running,
@@ -925,6 +968,7 @@ impl eframe::App for ArcLiveApp {
                     blocked_by_game: snapshot.game_running,
                     error: self.updates.error.clone(),
                 },
+                launchers: &launcher_titles,
                 capture: CaptureView {
                     handshakes: snapshot.tls_server_hellos,
                     key_errors: snapshot.tls_key_errors,

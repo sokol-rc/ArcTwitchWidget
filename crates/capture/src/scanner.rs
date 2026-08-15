@@ -22,7 +22,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use crate::packet::{TcpSegment, parse_ipv4_tcp};
-use crate::raw::{RawCapture, RawCaptureControl};
+use crate::source::{PacketSource, SourceControl};
 
 const MAX_SCAN_BUFFER: usize = 128 * 1024;
 const MAX_DISCOVERY_CONNECTIONS: usize = 256;
@@ -61,6 +61,10 @@ pub struct CaptureStats {
     pub connections_evicted: u64,
     pub last_host: Option<String>,
     pub last_path: Option<String>,
+    /// Which packet source is running: `raw socket` or `WinDivert`.
+    pub capture_backend: String,
+    /// Segments Winsock delivered truncated and we had to drop.
+    pub oversized_packets: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -84,7 +88,7 @@ pub enum CaptureEvent {
 pub struct CaptureHandle {
     pub events: Receiver<CaptureEvent>,
     stop: Arc<AtomicBool>,
-    control: Arc<Mutex<Option<RawCaptureControl>>>,
+    control: Arc<Mutex<Option<SourceControl>>>,
     worker: Option<thread::JoinHandle<()>>,
 }
 
@@ -134,16 +138,26 @@ pub fn start_capture(keylog_path: PathBuf) -> CaptureHandle {
 fn capture_loop(
     keylog_path: &Path,
     stop: Arc<AtomicBool>,
-    control: Arc<Mutex<Option<RawCaptureControl>>>,
+    control: Arc<Mutex<Option<SourceControl>>>,
     tx: &Sender<CaptureEvent>,
 ) -> Result<()> {
-    let (mut capture, capture_control) = RawCapture::open()?;
+    let (mut capture, capture_control, backend, fallback_reason) = PacketSource::open()?;
     *control.lock().expect("capture control poisoned") = Some(capture_control);
-    tx.try_send(CaptureEvent::Status(
-        "WinDivert bidirectional capture started".into(),
-    ))
+    tx.try_send(CaptureEvent::Status(format!(
+        "Bidirectional capture started ({})",
+        backend.as_str()
+    )))
     .ok();
-    let mut stats = CaptureStats::default();
+    if let Some(reason) = fallback_reason {
+        tx.try_send(CaptureEvent::Status(format!(
+            "Raw-socket capture was unavailable, using the driver instead: {reason}"
+        )))
+        .ok();
+    }
+    let mut stats = CaptureStats {
+        capture_backend: backend.as_str().to_owned(),
+        ..Default::default()
+    };
     let mut signature = None;
     let mut manager = build_manager(load_keylog(keylog_path, &mut stats)?);
     let mut frame = 0u64;
@@ -222,6 +236,7 @@ fn capture_loop(
         }
 
         if last_stats.elapsed() >= Duration::from_secs(1) {
+            stats.oversized_packets = capture.oversized_packets();
             stats.active_connections = manager.connections().count();
             stats.buffered_bytes = manager.total_memory();
             tx.try_send(CaptureEvent::Stats(Box::new(stats.clone())))
@@ -747,6 +762,16 @@ fn normalize_host(host: &str) -> Option<String> {
             .bytes()
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-')))
     .then_some(normalized)
+}
+
+/// A TLS record carrying a ClientHello handshake message.
+pub(crate) fn looks_like_client_hello(payload: &[u8]) -> bool {
+    payload.len() > 5 && payload[0] == 0x16 && payload[5] == 0x01
+}
+
+/// A TLS record carrying a ServerHello handshake message.
+pub(crate) fn looks_like_server_hello(payload: &[u8]) -> bool {
+    payload.len() > 5 && payload[0] == 0x16 && payload[5] == 0x02
 }
 
 fn tls_client_hello_sni(payload: &[u8]) -> Option<String> {

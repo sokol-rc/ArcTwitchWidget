@@ -15,7 +15,7 @@ use crossbeam_channel::{Receiver, Sender, bounded};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-pub const SERVICE_PROTOCOL_VERSION: u8 = 2;
+pub const SERVICE_PROTOCOL_VERSION: u8 = 3;
 pub const DEFAULT_SERVICE_ADDRESS: &str = "127.0.0.1:17843";
 
 pub fn service_address_file() -> Option<PathBuf> {

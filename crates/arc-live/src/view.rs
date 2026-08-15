@@ -94,6 +94,8 @@ pub struct UpdateView {
 pub struct ViewModel<'a> {
     pub page: Page,
     pub version: &'a str,
+    /// Packet source in use, shown in "О программе".
+    pub capture_backend: &'a str,
     pub overlay: &'a OverlayStats,
     pub connection: ConnectionView,
     pub stream: StreamView,
@@ -101,6 +103,8 @@ pub struct ViewModel<'a> {
     pub obs_url: &'a str,
     pub updates: UpdateView,
     pub capture: CaptureView,
+    /// Launchers ARC Live can restart with the key variable already set.
+    pub launchers: &'a [String],
     pub preset_error: Option<&'a str>,
 }
 
@@ -131,6 +135,8 @@ pub enum Action {
     CheckUpdates,
     DownloadUpdate,
     InstallUpdate,
+    /// Close the launcher and start it again with SSLKEYLOGFILE in place.
+    RestartLauncher(usize),
 }
 
 /// Installs the ARC Live look. Called once by the app and by the preview.
@@ -347,7 +353,7 @@ fn stream_page(ui: &mut egui::Ui, model: &ViewModel<'_>, actions: &mut Vec<Actio
     // A capture problem replaces the status card: telling the user that
     // everything works right above the reason it does not would be a lie.
     if let Some(problem) = capture_problem(&model.connection, &model.capture) {
-        capture_problem_card(ui, problem, &model.capture);
+        capture_problem_card(ui, problem, &model.capture, model.launchers, actions);
     } else {
         card(ui, |ui| {
             let connection = &model.connection;
@@ -485,7 +491,13 @@ fn stream_page(ui: &mut egui::Ui, model: &ViewModel<'_>, actions: &mut Vec<Actio
 }
 
 /// Explains a capture problem in the user's terms, with the exact next step.
-fn capture_problem_card(ui: &mut egui::Ui, problem: CaptureProblem, capture: &CaptureView) {
+fn capture_problem_card(
+    ui: &mut egui::Ui,
+    problem: CaptureProblem,
+    capture: &CaptureView,
+    launchers: &[String],
+    actions: &mut Vec<Action>,
+) {
     egui::Frame::group(ui.style())
         .inner_margin(egui::Margin::same(16))
         .corner_radius(egui::CornerRadius::same(10))
@@ -513,7 +525,46 @@ fn capture_problem_card(ui: &mut egui::Ui, problem: CaptureProblem, capture: &Ca
             ui.add_space(4.0);
             ui.label(explanation);
             ui.add_space(6.0);
-            ui.label(RichText::new(step).strong());
+            // With a launcher at hand the button does the whole job, so the
+            // manual reboot is only offered when there is nothing to press.
+            if launchers.is_empty() {
+                ui.label(RichText::new(step).strong());
+            } else {
+                ui.label(
+                    RichText::new(
+                        "Нажмите кнопку ниже — ARC Live закроет лаунчер и запустит его заново уже с ключами.",
+                    )
+                    .strong(),
+                );
+                ui.label(
+                    RichText::new(format!("Если не поможет: {step}"))
+                        .small()
+                        .color(COLOR_MUTED),
+                );
+            }
+            ui.add_space(6.0);
+            if !launchers.is_empty() {
+                ui.add_space(4.0);
+                ui.horizontal_wrapped(|ui| {
+                    for (index, title) in launchers.iter().enumerate() {
+                        if ui
+                            .button(format!("Перезапустить {title} со статистикой"))
+                            .on_hover_text(
+                                "ARC Live закроет лаунчер и запустит его заново уже с ключами. \
+                                 Перезагрузка Windows не нужна.",
+                            )
+                            .clicked()
+                        {
+                            actions.push(Action::RestartLauncher(index));
+                        }
+                    }
+                });
+                ui.label(
+                    RichText::new("После перезапуска лаунчера запустите игру как обычно.")
+                        .small()
+                        .color(COLOR_MUTED),
+                );
+            }
             ui.add_space(6.0);
             ui.label(
                 RichText::new(format!(
@@ -913,6 +964,12 @@ fn settings_page(ui: &mut egui::Ui, model: &ViewModel<'_>, actions: &mut Vec<Act
             })
             .color(COLOR_MUTED),
         );
+        if !model.capture_backend.is_empty() {
+            ui.label(
+                RichText::new(format!("Движок захвата: {}", model.capture_backend))
+                    .color(COLOR_MUTED),
+            );
+        }
     });
 }
 

@@ -222,6 +222,12 @@ pub struct AppState {
     pub active_capture_connections: usize,
     pub capture_buffered_bytes: usize,
     pub capture_connections_evicted: u64,
+    /// Which packet source the capture service is running on.
+    #[serde(default)]
+    pub capture_backend: String,
+    /// Segments Winsock delivered truncated and the capture had to drop.
+    #[serde(default)]
+    pub oversized_packets: u64,
     pub overlay: OverlayStats,
     pub last_update: DateTime<Utc>,
     pub activity: VecDeque<ActivityItem>,
@@ -261,6 +267,8 @@ impl AppState {
             active_capture_connections: 0,
             capture_buffered_bytes: 0,
             capture_connections_evicted: 0,
+            capture_backend: String::new(),
+            oversized_packets: 0,
             overlay: OverlayStats {
                 mode: "live".to_owned(),
                 preset: "account".to_owned(),

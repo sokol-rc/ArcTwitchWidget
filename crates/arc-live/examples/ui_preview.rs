@@ -22,6 +22,7 @@ struct Preview {
     requested: bool,
     overlay: OverlayStats,
     events: Vec<EventView>,
+    launchers: Vec<String>,
 }
 
 fn main() -> eframe::Result<()> {
@@ -59,6 +60,7 @@ fn main() -> eframe::Result<()> {
         frames_on_page: 0,
         requested: false,
         overlay,
+        launchers: vec!["Steam".to_owned()],
         events: vec![
             EventView {
                 time: "14:51".into(),
@@ -104,7 +106,8 @@ impl eframe::App for Preview {
 
         let model = ViewModel {
             page,
-            version: "0.13.0",
+            version: "0.14.0",
+            capture_backend: "raw socket",
             overlay: &self.overlay,
             connection: ConnectionView {
                 game_running: true,
@@ -124,6 +127,7 @@ impl eframe::App for Preview {
                 channel: "stable".to_owned(),
                 ..Default::default()
             },
+            launchers: &self.launchers,
             capture: if name == "04-stream-no-keys" {
                 CaptureView {
                     handshakes: 55,

@@ -2,6 +2,14 @@
 
 All notable changes to ARC Live are documented here.
 
+## 0.14.0 - 2026-08-15
+
+- Added a driver-free packet source built on Windows raw sockets (SIO_RCVALL).
+- Kept WinDivert as the fallback and switched to it automatically when the raw socket delivered no inbound packets.
+- Added a button that restarts Steam or Epic with the key log variable already set, so a fresh install works without a Windows reboot.
+- Showed the active capture engine in the settings screen and in diagnostics.
+- Bumped the service protocol to 3 for the extended capture statistics.
+
 ## 0.13.1 — 2026-08-15
 
 - Read `SSLKEYLOGFILE` from the running game and name the exact reason when statistics never arrive.
