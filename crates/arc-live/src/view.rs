@@ -894,12 +894,18 @@ fn settings_page(ui: &mut egui::Ui, model: &ViewModel<'_>, actions: &mut Vec<Act
                 ui.label("Проверяем…");
             } else if let Some(version) = &model.updates.available {
                 ui.label(
-                    RichText::new(format!("Доступна версия {version}"))
+                    RichText::new(format!("Установлена {}, доступна {version}", model.version))
                         .color(COLOR_ACCENT)
                         .strong(),
                 );
             } else {
-                ui.label(RichText::new("Установлена актуальная версия").color(COLOR_MUTED));
+                ui.label(
+                    RichText::new(format!(
+                        "Установлена {} — это последняя версия",
+                        model.version
+                    ))
+                    .color(COLOR_MUTED),
+                );
             }
         });
         if model.updates.available.is_some() && !model.updates.downloaded {

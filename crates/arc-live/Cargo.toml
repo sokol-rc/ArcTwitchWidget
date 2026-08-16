@@ -43,3 +43,4 @@ windows-sys.workspace = true
 
 [target.'cfg(windows)'.build-dependencies]
 embed-manifest = "1.5"
+winresource = "0.1.24"

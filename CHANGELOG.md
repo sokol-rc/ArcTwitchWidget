@@ -2,6 +2,13 @@
 
 All notable changes to ARC Live are documented here.
 
+## 0.15.0 - 2026-08-16
+
+- Added the ARC Live icon to the executable, the window, the taskbar, the tray, the Start menu shortcut and the installer.
+- Reopened the application automatically once an update has been installed.
+- Named the installed version next to the available one on the update screen.
+- Stopped registering ARC Live in Windows startup and removed the entry left by earlier versions.
+
 ## 0.14.0 - 2026-08-15
 
 - Added a capture source on the packet-capture provider that ships with Windows, so no third-party driver is needed.

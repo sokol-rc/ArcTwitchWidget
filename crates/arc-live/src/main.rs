@@ -1,5 +1,6 @@
 #![cfg_attr(windows, windows_subsystem = "windows")]
 
+mod branding;
 mod process_env;
 mod process_monitor;
 mod server;
@@ -135,6 +136,7 @@ fn run() -> Result<()> {
         viewport: eframe::egui::ViewportBuilder::default()
             .with_inner_size([920.0, 720.0])
             .with_min_inner_size([720.0, 560.0])
+            .with_icon(branding::window_icon())
             .with_visible(!start_hidden),
         ..Default::default()
     };

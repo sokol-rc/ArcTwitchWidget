@@ -142,7 +142,17 @@ impl UpdateManager {
             .downloaded
             .as_ref()
             .context("no downloaded update is ready")?;
-        let script = "$targetPid = [int]$env:ARC_LIVE_UPDATE_WAIT_PID; Wait-Process -Id $targetPid -ErrorAction SilentlyContinue; Start-Process -FilePath $env:ARC_LIVE_UPDATE_INSTALLER -ArgumentList @('/passive','/norestart')";
+        // Waits for this process to go away, installs, then brings the updated
+        // application back so the user does not have to find it in the menu.
+        let script = "$targetPid = [int]$env:ARC_LIVE_UPDATE_WAIT_PID; \
+             Wait-Process -Id $targetPid -ErrorAction SilentlyContinue; \
+             Start-Process -FilePath $env:ARC_LIVE_UPDATE_INSTALLER \
+             -ArgumentList @('/passive','/norestart') -Wait; \
+             Start-Sleep -Seconds 3; \
+             $application = $env:ARC_LIVE_UPDATE_RELAUNCH; \
+             if ($application -and (Test-Path -LiteralPath $application)) { \
+             Start-Process -FilePath $application }";
+        let relaunch = std::env::current_exe().unwrap_or_default();
         Command::new("powershell.exe")
             .args([
                 "-NoProfile",
@@ -154,6 +164,7 @@ impl UpdateManager {
             ])
             .env("ARC_LIVE_UPDATE_WAIT_PID", std::process::id().to_string())
             .env("ARC_LIVE_UPDATE_INSTALLER", path)
+            .env("ARC_LIVE_UPDATE_RELAUNCH", relaunch)
             .spawn()
             .with_context(|| format!("scheduling {} after ARC Live exits", path.display()))?;
         Ok(())

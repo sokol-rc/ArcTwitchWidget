@@ -10,6 +10,9 @@
     <MajorUpgrade DowngradeErrorMessage="Установлена более новая версия ARC Live." />
     <MediaTemplate EmbedCab="yes" CompressionLevel="high" />
 
+    <Icon Id="ArcLiveIcon" SourceFile="$(var.StageDir)\arc-live.ico" />
+    <Property Id="ARPPRODUCTICON" Value="ArcLiveIcon" />
+
     <Feature Id="MainFeature" Title="ARC Live" Level="1">
       <ComponentGroupRef Id="ApplicationComponents" />
     </Feature>
@@ -59,6 +62,7 @@
             Name="ARC Live"
             Description="Статистика ARC Raiders для OBS"
             Target="[#ArcLiveExe]"
+            Icon="ArcLiveIcon"
             WorkingDirectory="INSTALLFOLDER" />
         <RemoveFolder Id="RemoveApplicationProgramsFolder" On="uninstall" />
         <RegistryValue
@@ -68,12 +72,12 @@
             Type="integer"
             Value="1"
             KeyPath="yes" />
-        <RegistryValue
+        <!-- ARC Live is started by the user, never by Windows. Versions up to
+             0.14.0 registered themselves here, so the value is cleaned up. -->
+        <RemoveRegistryValue
             Root="HKLM"
             Key="Software\Microsoft\Windows\CurrentVersion\Run"
-            Name="ARC Live"
-            Type="string"
-            Value="&quot;[#ArcLiveExe]&quot; --background" />
+            Name="ARC Live" />
       </Component>
     </ComponentGroup>
   </Package>

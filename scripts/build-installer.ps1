@@ -52,6 +52,7 @@ try {
     Copy-Item -LiteralPath 'vendor\windivert\WinDivert-2.2.2-A\x64\WinDivert64.sys' -Destination $stageDirectory -Force
     Copy-Item -LiteralPath 'THIRD-PARTY-NOTICES.md' -Destination $stageDirectory -Force
     Copy-Item -LiteralPath 'widget-config.json' -Destination (Join-Path $stageDirectory 'widget-config.default.json') -Force
+    Copy-Item -LiteralPath 'assets\icon.ico' -Destination (Join-Path $stageDirectory 'arc-live.ico') -Force
 
     $portableDirectory = Join-Path $projectDirectory 'target\portable-stage'
     New-Item -ItemType Directory -Force -Path $portableDirectory | Out-Null

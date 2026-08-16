@@ -16,3 +16,4 @@
 .env
 .env.*
 service-token
+__pycache__/

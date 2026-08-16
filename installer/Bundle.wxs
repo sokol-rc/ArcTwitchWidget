@@ -4,7 +4,8 @@
       Name="ARC Live"
       Manufacturer="ARC Live"
       Version="$(var.ProductVersion)"
-      UpgradeCode="9DD54F6A-C513-4597-A0DD-D479D8D3082B">
+      UpgradeCode="9DD54F6A-C513-4597-A0DD-D479D8D3082B"
+      IconSourceFile="$(var.ProjectDir)\assets\icon.ico">
     <BootstrapperApplication>
       <bal:WixStandardBootstrapperApplication
           Theme="rtfLicense"

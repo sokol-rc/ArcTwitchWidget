@@ -30,7 +30,7 @@ impl TrayController {
         let tray = TrayIconBuilder::new()
             .with_menu(Box::new(menu))
             .with_tooltip("ARC Live — статистика для OBS")
-            .with_icon(Icon::from_rgba(icon_pixels(), 32, 32)?)
+            .with_icon(Icon::from_rgba(crate::branding::icon_rgba(32), 32, 32)?)
             .build()?;
         Ok(Self {
             _tray: tray,
@@ -75,32 +75,4 @@ impl TrayController {
     pub fn poll(&self) -> Option<TrayAction> {
         None
     }
-}
-
-#[cfg(windows)]
-fn icon_pixels() -> Vec<u8> {
-    let mut pixels = vec![0u8; 32 * 32 * 4];
-    for y in 0..32usize {
-        for x in 0..32usize {
-            let index = (y * 32 + x) * 4;
-            let dx = x as f32 - 15.5;
-            let dy = y as f32 - 15.5;
-            let inside = dx * dx + dy * dy <= 14.5 * 14.5;
-            if inside {
-                pixels[index] = 9;
-                pixels[index + 1] = 16;
-                pixels[index + 2] = 21;
-                pixels[index + 3] = 255;
-                let left_stroke = (x as i32 - (10 + y as i32 / 3)).abs() <= 2;
-                let right_stroke = (x as i32 - (21 - y as i32 / 3)).abs() <= 2;
-                let crossbar = (19..=22).contains(&y) && (11..=20).contains(&x);
-                if (y >= 7 && (left_stroke || right_stroke)) || crossbar {
-                    pixels[index] = 83;
-                    pixels[index + 1] = 224;
-                    pixels[index + 2] = 161;
-                }
-            }
-        }
-    }
-    pixels
 }
