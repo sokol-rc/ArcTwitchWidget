@@ -37,6 +37,9 @@ const DISCOVERY_CONNECTION_TIMEOUT: Duration = CONNECTION_IDLE_TIMEOUT;
 /// Connections to the game's API are never evicted to make room for others.
 /// Their number is still bounded, so a long stream cannot grow the map forever.
 const MAX_TRACKED_API_CONNECTIONS: usize = 64;
+/// The one endpoint ARC Live reads. The game requests it on every return to the
+/// lobby; the response is recognised by its body as well as by this path.
+const PLAYER_STATS_PATH: &str = "/v1/pioneer/stats/player-v2";
 const MAX_DECODED_BODY: u64 = 4 * 1024 * 1024;
 const MAX_KEYLOG_WINDOW: u64 = 4 * 1024 * 1024;
 const MAX_CLIENT_RANDOMS: usize = 2_048;
@@ -634,11 +637,11 @@ impl StreamParser for DiscoveryParser {
                 method = Some(request_method);
                 path = Some(request_path);
             }
-            let is_player_stats = method.as_deref() == Some("POST")
-                && path.as_deref().is_some_and(|value| {
-                    value.split('?').next() == Some("/v1/pioneer/stats/player-v2")
-                });
-            if status.is_none() && is_player_stats {
+            let path_is_player_stats = method.as_deref() == Some("POST")
+                && path
+                    .as_deref()
+                    .is_some_and(|value| value.split('?').next() == Some(PLAYER_STATS_PATH));
+            if status.is_none() && path_is_player_stats {
                 messages.push(discovery_message(
                     context,
                     "stats_stream_ready",
@@ -659,6 +662,25 @@ impl StreamParser for DiscoveryParser {
                 .as_ref()
                 .map(|value| json_shape(value, 0))
                 .unwrap_or(Value::Null);
+            // Responses are paired with requests by order on the connection, and
+            // one response we never saw shifts that pairing for good - the game
+            // fires dozens of requests at once when the player returns to the
+            // lobby. The body itself is the reliable marker, so it decides, and
+            // a disagreement resynchronises the queue instead of silently
+            // mislabelling every later response.
+            let body_is_player_stats = status.is_some()
+                && decoded_json
+                    .as_ref()
+                    .is_some_and(|value| value.get("scopedPlayerStats").is_some());
+            if body_is_player_stats && !path_is_player_stats {
+                method = Some("POST".to_owned());
+                path = Some(PLAYER_STATS_PATH.to_owned());
+                self.pending_requests
+                    .lock()
+                    .expect("pending requests poisoned")
+                    .remove(&context.connection_id);
+            }
+            let is_player_stats = path_is_player_stats || body_is_player_stats;
             if status.is_some_and(|value| (200..300).contains(&value))
                 && is_player_stats
                 && let Some(stats) = decoded_json.as_ref()
@@ -1076,6 +1098,83 @@ mod tests {
             Some("api-gateway.asia.es-pio.net")
         );
         assert!(string_field(stats, "stats_body").is_some());
+    }
+
+    #[test]
+    fn reads_the_statistics_even_after_the_request_pairing_drifted() {
+        // The lobby burst loses one response, so every later response on this
+        // connection would be paired with the wrong request. The statistics must
+        // still be read, and the pairing must recover.
+        let parser = DiscoveryParser::default();
+        let to_server = StreamContext {
+            connection_id: 11,
+            direction: Direction::ToServer,
+            src_ip: "127.0.0.1".parse().unwrap(),
+            dst_ip: "127.0.0.2".parse().unwrap(),
+            src_port: 50_000,
+            dst_port: 443,
+            bytes_parsed: 0,
+            messages_parsed: 0,
+            alpn: None,
+        };
+        let connection_id = to_server.connection_id;
+        let to_client = StreamContext {
+            connection_id,
+            direction: Direction::ToClient,
+            src_ip: to_server.dst_ip,
+            dst_ip: to_server.src_ip,
+            src_port: to_server.dst_port,
+            dst_port: to_server.src_port,
+            bytes_parsed: 0,
+            messages_parsed: 0,
+            alpn: None,
+        };
+
+        for path in ["/v1/shared/heartbeat", "/v1/pioneer/inventory"] {
+            parser.parse_stream(
+                format!(
+                    "POST {path} HTTP/1.1\r\nHost: api-gateway.europe.es-pio.net\r\nContent-Length: 0\r\n\r\n"
+                )
+                .as_bytes(),
+                &to_server,
+            );
+        }
+        parser.parse_stream(
+            b"POST /v1/pioneer/stats/player-v2 HTTP/1.1\r\nHost: api-gateway.europe.es-pio.net\r\nContent-Length: 0\r\n\r\n",
+            &to_server,
+        );
+
+        // Only the statistics answer comes back; the two before it were missed.
+        let body = br#"{"scopedPlayerStats":[]}"#;
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+            body.len(),
+            std::str::from_utf8(body).unwrap()
+        );
+        let StreamParseResult::Complete { messages, .. } =
+            parser.parse_stream(response.as_bytes(), &to_client)
+        else {
+            panic!("response was not parsed");
+        };
+        let stats = messages
+            .iter()
+            .find(|message| {
+                string_field(message, "kind").as_deref() == Some("player_stats_response")
+            })
+            .expect("the statistics response must be recognised by its body");
+        assert_eq!(
+            string_field(stats, "path").as_deref(),
+            Some(PLAYER_STATS_PATH)
+        );
+        assert!(
+            parser
+                .pending_requests
+                .lock()
+                .expect("pending requests poisoned")
+                .get(&connection_id)
+                .is_none_or(|queue| queue.is_empty()),
+            "the drifted queue must be dropped so later responses pair correctly"
+        );
     }
 
     #[test]

@@ -2,6 +2,13 @@
 
 All notable changes to ARC Live are documented here.
 
+## 0.19.0 - 2026-08-17
+
+- Recognised the statistics response by its own body, so a raid is no longer skipped when one earlier response was missed.
+- Resynchronised request pairing on that connection instead of mislabelling every later response.
+- Named in the event log what each response changed, and said plainly when the game returned unchanged numbers.
+- Explained on the first response that the stream baseline starts there.
+
 ## 0.18.0 - 2026-08-17
 
 - Kept the game's API connection alive across a whole raid, so statistics update after every raid instead of only at login.

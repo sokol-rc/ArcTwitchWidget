@@ -45,6 +45,8 @@ pub struct ArcLiveApp {
     widget_config_error: Option<String>,
     launchers: Vec<(session_setup::Launcher, std::path::PathBuf)>,
     confirm_new_stream: bool,
+    /// Absolute totals from the previous game response, to report what changed.
+    last_totals: Option<OverlayStats>,
     /// The risk-notice checkbox; the decision itself lives in the config.
     disclaimer_confirmed: bool,
     onboarding_step: usize,
@@ -142,6 +144,7 @@ impl ArcLiveApp {
             widget_config_error: None,
             launchers: session_setup::installed_launchers(),
             confirm_new_stream: false,
+            last_totals: None,
             disclaimer_confirmed: false,
             onboarding_step: 0,
             page: Page::Stream,
@@ -585,7 +588,20 @@ impl ArcLiveApp {
                 .record("error", format!("Saving stats sync failed: {error}"));
         }
         let mut overlay = payload.overlay;
-        if self.session_baseline.is_none() {
+        // What the game reported last time, so the event log can say out loud
+        // what this response changed. Without it a raid the server has not
+        // finished counting yet looks exactly like a broken capture.
+        let change = self.last_totals.as_ref().map(|previous| {
+            (
+                overlay.raids.saturating_sub(previous.raids),
+                overlay.extractions.saturating_sub(previous.extractions),
+                overlay.deaths.saturating_sub(previous.deaths),
+                overlay.loot_value.saturating_sub(previous.loot_value),
+            )
+        });
+        self.last_totals = Some(overlay.clone());
+        let first_response = self.session_baseline.is_none();
+        if first_response {
             self.session_baseline = Some(overlay.clone());
             self.stream_started_at = Some(Utc::now());
         }
@@ -634,13 +650,42 @@ impl ArcLiveApp {
             );
         }
         self.persist_stream_session(&overlay);
+        let message = match change {
+            Some((raids, extractions, deaths, loot)) if raids > 0 => {
+                let mut parts = vec![format!("+{raids} рейд")];
+                if extractions > 0 {
+                    parts.push(format!("вышел живым: +{extractions}"));
+                }
+                if deaths > 0 {
+                    parts.push(format!("погиб: +{deaths}"));
+                }
+                if loot > 0 {
+                    parts.push(format!("вынесено: {}", view::grouped(loot)));
+                }
+                format!("Статистика обновлена — {}", parts.join(", "))
+            }
+            // The response arrived and was read, but the game returned the same
+            // numbers: the server had not counted the raid yet. It lands on the
+            // next response instead of being lost.
+            Some(_) => {
+                "Игра прислала статистику без изменений — рейд ещё не посчитан на её стороне, \
+                 придёт со следующим ответом"
+                    .to_owned()
+            }
+            None if first_response => {
+                "Статистика подключена. Точка отсчёта стрима взята сейчас — рейд, который уже \
+                 закончился, в счётчики стрима не попадёт"
+                    .to_owned()
+            }
+            None => "Статистика обновлена после возвращения в Сперанцу".to_owned(),
+        };
         self.record_user_event(
-            "success",
-            if self.last_sync_succeeded {
-                "Статистика обновлена после возвращения в Сперанцу"
+            if matches!(change, Some((0, ..))) {
+                "info"
             } else {
-                "Статистика подключена и текущий стрим восстановлен"
+                "success"
             },
+            message,
         );
         self.last_sync_succeeded = true;
     }
