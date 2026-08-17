@@ -77,8 +77,8 @@ pub fn capture_problem(
 pub const DISCLAIMER_TITLE: &str = "Прочитайте до начала работы";
 pub const DISCLAIMER_PARAGRAPHS: [&str; 4] = [
     "ARC Live - независимый любительский проект. Он не связан с Embark Studios, \
-     не одобрен и не поддерживается ими. ARC Raiders и все материалы игры принадлежат \
-     Embark Studios.",
+     не одобрен и не поддерживается ими. ARC Raiders, названия и материалы игры - \
+     товарные знаки и объекты авторского права Embark Studios и её лицензиаров.",
     "Это исследовательская сборка. Чтобы посчитать статистику, ARC Live расшифровывает \
      и читает сетевые ответы игры на вашем компьютере. Пользовательское соглашение игры \
      запрещает перехват и анализ её сетевого протокола, а античит может счесть нарушением \
@@ -92,9 +92,10 @@ pub const DISCLAIMER_PARAGRAPHS: [&str; 4] = [
 ];
 /// What the application deliberately does not do. Kept next to the warning so
 /// the picture is complete rather than one-sided.
-pub const DISCLAIMER_LIMITS: [&str; 4] = [
+pub const DISCLAIMER_LIMITS: [&str; 5] = [
     "не изменяет файлы игры и не читает её память",
     "не управляет вводом и не даёт преимущества в бою",
+    "смотрит только трафик этого компьютера и только ответы самой игры",
     "не отправляет наружу ни статистику, ни ключи, ни токены",
     "не обращается к серверам Embark от своего имени",
 ];

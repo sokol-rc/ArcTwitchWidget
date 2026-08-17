@@ -3,8 +3,8 @@
 ## Disclaimer
 
 **ARC Live is an independent hobby project. It is not affiliated with,
-endorsed by, or supported by Embark Studios. ARC Raiders and all game
-materials belong to Embark Studios.**
+endorsed by, or supported by Embark Studios. ARC Raiders, its name and its
+materials are trademarks and copyrights of Embark Studios and its licensors.**
 
 This is a research build. To produce statistics, ARC Live decrypts and reads
 the game's own network responses on the local machine. The game's terms of
@@ -24,6 +24,8 @@ What ARC Live does not do:
 
 - it does not modify game files and does not read game memory;
 - it does not automate input and gives no advantage in combat;
+- it only ever looks at traffic on this machine, and only at the game's own
+  responses;
 - it does not send statistics, keys, or tokens anywhere;
 - it does not call Embark servers on its own behalf.
 
