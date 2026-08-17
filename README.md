@@ -94,6 +94,10 @@ stream counters. An OBS source can override the selection with `?preset=<id>` or
 and English and controls its background opacity. Individual Browser Sources can
 override those settings with `?lang=ru|en`, `?opacity=0..100`, `?bg=RRGGBB`,
 and `?blur=0..20`. The readable headerless Browser Source size is `700 × 80`.
+The widget scales itself to whatever size the Browser Source is given, drawing
+text at the final resolution, so a bigger widget comes from resizing the source
+(for example `1400 × 160`) rather than stretching it in the scene. `?scale=`
+sets the factor manually and `?fit=off` restores the unscaled behaviour.
 The app provides Transparent, Smoke, Glass, and Solid background presets plus a
 custom color picker, opacity slider, and blur slider. Session balance is
 rendered with an explicit green plus or red minus.
@@ -183,3 +187,21 @@ installer does not yet have a commercial Windows Authenticode certificate, so
 Windows SmartScreen can show an unknown-publisher warning. Authenticode can be
 added later as a second trust layer without changing the update protocol. See
 [`docs/INSTALLATION_RELEASE_RU.md`](docs/INSTALLATION_RELEASE_RU.md).
+
+## License
+
+ARC Live is source-available under the
+[PolyForm Noncommercial License 1.0.0](LICENSE).
+
+- **Noncommercial use is free.** Personal use, hobby projects, streaming for
+  yourself, research and education are permitted at no charge.
+- **Commercial use requires a separate license** from the copyright holder.
+- This is a source-available license, not an OSI-approved "open source" license,
+  because it restricts commercial use.
+
+Releases up to and including 0.16.0 were published under the MIT License and
+stay available under those terms; this license applies from 0.17.0 onwards.
+
+The vendored `vendor/pcapsql-core` library is third-party software under the MIT
+License. Other dependencies retain their own licenses. See
+[`THIRD-PARTY-NOTICES.md`](THIRD-PARTY-NOTICES.md).

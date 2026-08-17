@@ -791,6 +791,17 @@ fn widget_page(ui: &mut egui::Ui, model: &ViewModel<'_>, actions: &mut Vec<Actio
                 .small()
                 .color(COLOR_MUTED),
         );
+        ui.add_space(6.0);
+        ui.label(RichText::new("Нужен виджет крупнее?").strong());
+        ui.label(
+            RichText::new(
+                "Задайте размер в свойствах самого источника - например 1400 × 160, - и виджет \
+                 подстроится сам. Не растягивайте источник мышью в сцене: OBS увеличит уже \
+                 готовую картинку, и шрифты станут мутными.",
+            )
+            .small()
+            .color(COLOR_MUTED),
+        );
     });
 
     section(ui, "Оформление");

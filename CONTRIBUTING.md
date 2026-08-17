@@ -1,5 +1,15 @@
 # Contributing
 
+## Contribution license
+
+ARC Live is source-available under the PolyForm Noncommercial License 1.0.0, and
+the project owner also licenses it commercially. By opening a pull request you
+grant the project owner a perpetual, worldwide, irrevocable, royalty-free right
+to use, modify, sublicense and relicense your contribution, including under
+commercial terms, and you confirm that the contribution is yours to give. Without
+that grant a contribution cannot be merged, because it would block the dual
+licensing the project depends on.
+
 ARC Live targets Windows and uses Rust 2024. Keep changes local-first: no game
 credentials, raw API values, or TLS key material may be persisted or exposed by
 the localhost API.

@@ -2,6 +2,14 @@
 
 All notable changes to ARC Live are documented here.
 
+## 0.17.0 - 2026-08-16
+
+- Scaled the OBS widget to the size of its Browser Source, so enlarging it no longer blurs the text.
+- Added `scale` and `fit` overlay parameters for manual control.
+- Explained in the app how to enlarge the widget without stretching it in the scene.
+- Moved the project to the PolyForm Noncommercial License 1.0.0; releases up to 0.16.0 stay under MIT.
+- Credited the vendored pcapsql-core modifications to their author.
+
 ## 0.16.0 - 2026-08-16
 
 - Added a risk notice that must be confirmed before the application can be used.

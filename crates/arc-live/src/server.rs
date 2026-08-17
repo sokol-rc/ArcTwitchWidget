@@ -242,6 +242,8 @@ const LIVE_OVERLAY_HTML_V2: &str = r#"<!doctype html>
 <html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width">
 <style>
 *{box-sizing:border-box}html,body{margin:0;background:transparent;color:#f7f8f9;font-family:"Segoe UI Variable Text","Segoe UI",sans-serif;overflow:hidden}body{padding:4px}.panel{--panel-color:9 16 21;--panel-alpha:.55;--border-alpha:.16;--panel-blur:6px;--cells:3;display:grid;grid-template-columns:repeat(var(--cells),minmax(0,1fr));width:min(690px,calc(100vw - 8px));padding:5px 6px;background:rgb(var(--panel-color)/var(--panel-alpha));border:1px solid rgb(255 255 255/var(--border-alpha));border-radius:8px;backdrop-filter:blur(var(--panel-blur))}.cell{min-width:0;min-height:58px;display:grid;align-content:center;padding:7px 14px;border-left:1px solid rgb(255 255 255/var(--border-alpha))}.cell:first-child{border-left:0}.panel[data-cells="2"] .cell,.panel[data-cells="1"] .cell{text-align:center}.value{min-width:0;overflow:hidden;color:#f7f8f9;font-size:34px;font-weight:800;line-height:1;letter-spacing:-.025em;text-overflow:ellipsis;white-space:nowrap;font-variant-numeric:tabular-nums}.panel[data-cells="2"] .value,.panel[data-cells="1"] .value{font-size:38px}.label{margin-top:6px;overflow:hidden;color:#c5d0d5;font-size:10px;font-weight:600;line-height:1.15;letter-spacing:.035em;text-overflow:ellipsis;text-transform:uppercase;white-space:nowrap}.accent{color:#58e3a3}.danger{color:#ff727f}.loot{color:#ffc35a}@media(max-width:480px){body{padding:2px}.panel{width:calc(100vw - 4px);padding:4px}.cell{min-height:54px;padding:6px 8px}.value{font-size:28px}.label{font-size:9px}}
+/* Fitted mode: the widget is drawn at its 700x80 design size and the whole body is zoomed to the Browser Source, so text is rasterized at the final resolution instead of being stretched by OBS. The viewport-relative rules above must not apply here - they would shrink the panel a second time. */
+body.fit{padding:4px}body.fit .panel{width:690px;padding:5px 6px}body.fit .cell{min-height:58px;padding:7px 14px}body.fit .value{font-size:34px}body.fit .panel[data-cells="2"] .value,body.fit .panel[data-cells="1"] .value{font-size:38px}body.fit .label{font-size:10px}
 </style></head><body><div id="panel" class="panel"></div>
 <script>
 const params=new URLSearchParams(location.search),presetOverride=params.get('preset'),languageOverride=params.get('lang')||params.get('language'),opacityOverride=params.get('opacity'),backgroundOverride=params.get('background')||params.get('bg'),blurOverride=params.get('blur');
@@ -278,7 +280,17 @@ function draw(s){
   box.append(value,label);panel.append(box);
  }
 }
+const BASE_W=700,BASE_H=80,scaleOverride=Number(params.get('scale')),fitDisabled=/^(0|off|no|false)$/i.test(params.get('fit')||'');
+function fit(){
+ const body=document.body;
+ if(fitDisabled){body.classList.remove('fit');body.style.zoom='';return}
+ body.classList.add('fit');
+ const manual=Number.isFinite(scaleOverride)&&scaleOverride>0?Math.min(8,Math.max(.25,scaleOverride)):0;
+ const auto=Math.min(innerWidth/BASE_W,innerHeight/BASE_H);
+ body.style.zoom=String(Math.min(8,Math.max(.25,manual||auto)));
+}
 async function init(){try{draw(await(await fetch('/api/v1/overlay')).json())}catch{}}
 function connect(){const ws=new WebSocket(`ws://${location.host}/ws`);ws.onmessage=e=>draw(JSON.parse(e.data).data);ws.onclose=()=>setTimeout(connect,1000)}
+addEventListener('resize',fit);fit();
 init();connect();
 </script></body></html>"#;

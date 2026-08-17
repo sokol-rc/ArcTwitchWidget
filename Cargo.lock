@@ -124,7 +124,7 @@ dependencies = [
 
 [[package]]
 name = "arc-live"
-version = "0.16.0"
+version = "0.17.0"
 dependencies = [
  "anyhow",
  "arc-live-capture",
@@ -158,7 +158,7 @@ dependencies = [
 
 [[package]]
 name = "arc-live-capture"
-version = "0.16.0"
+version = "0.17.0"
 dependencies = [
  "anyhow",
  "arc-live-core",
@@ -178,7 +178,7 @@ dependencies = [
 
 [[package]]
 name = "arc-live-capture-service"
-version = "0.16.0"
+version = "0.17.0"
 dependencies = [
  "anyhow",
  "arc-live-collector",
@@ -195,7 +195,7 @@ dependencies = [
 
 [[package]]
 name = "arc-live-collector"
-version = "0.16.0"
+version = "0.17.0"
 dependencies = [
  "anyhow",
  "arc-live-capture",
@@ -208,7 +208,7 @@ dependencies = [
 
 [[package]]
 name = "arc-live-core"
-version = "0.16.0"
+version = "0.17.0"
 dependencies = [
  "anyhow",
  "chrono",
@@ -222,7 +222,7 @@ dependencies = [
 
 [[package]]
 name = "arc-live-diagnostics"
-version = "0.16.0"
+version = "0.17.0"
 dependencies = [
  "anyhow",
  "arc-live-core",
@@ -235,7 +235,7 @@ dependencies = [
 
 [[package]]
 name = "arc-live-release-tool"
-version = "0.16.0"
+version = "0.17.0"
 dependencies = [
  "anyhow",
  "base64",
@@ -248,7 +248,7 @@ dependencies = [
 
 [[package]]
 name = "arc-live-storage"
-version = "0.16.0"
+version = "0.17.0"
 dependencies = [
  "anyhow",
  "arc-live-core",
