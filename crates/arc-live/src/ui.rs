@@ -624,13 +624,19 @@ impl ArcLiveApp {
                 self.widget_config_error = Some(message);
             }
         }
+        // The preset the user picked is carried over as is. Preset ids are
+        // user-defined since schema 2, so anything else silently threw the
+        // choice away on every response; `apply` repairs a deleted one.
+        overlay.preset = self
+            .state
+            .read()
+            .expect("state poisoned")
+            .overlay
+            .preset
+            .clone();
         self.widget_config.apply(&mut overlay);
         {
             let mut state = self.state.write().expect("state poisoned");
-            overlay.preset = match state.overlay.preset.as_str() {
-                "session" | "outcome" | "pve" | "pvp" => state.overlay.preset.clone(),
-                _ => "account".to_owned(),
-            };
             overlay.language = match state.overlay.language.as_str() {
                 "en" => "en".to_owned(),
                 _ => "ru".to_owned(),

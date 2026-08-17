@@ -24,7 +24,15 @@ use serde_json::{Value, json};
 use crate::packet::{TcpSegment, parse_ipv4_tcp};
 use crate::source::{PacketSource, SourceControl};
 
+/// How much unframed data is kept while looking for the start of a message.
+/// Only applies when no message header is in sight - a message whose length is
+/// already known is allowed to finish arriving, up to [`MAX_MESSAGE_BYTES`].
 const MAX_SCAN_BUFFER: usize = 128 * 1024;
+/// The largest single HTTP message that is assembled. The statistics response
+/// grows with the account's history and passed the old 128 KiB scan buffer for
+/// long-lived accounts, which silently stopped their capture; anything past
+/// this is walked past by length rather than cut out of the stream.
+const MAX_MESSAGE_BYTES: usize = 8 * 1024 * 1024;
 const MAX_DISCOVERY_CONNECTIONS: usize = 256;
 const MAX_PENDING_REQUESTS: usize = 16;
 /// How long a silent connection is kept. The game holds one HTTPS connection to
@@ -458,6 +466,9 @@ struct DiscoveryParser {
     pending_requests: PendingRequests,
     last_seen: Arc<Mutex<HashMap<u64, Instant>>>,
     parse_count: Arc<AtomicU64>,
+    /// Bytes of a body too large to keep that still have to be walked past, so
+    /// the stream stays framed instead of being cut in the middle of a message.
+    skipped_bodies: Arc<Mutex<HashMap<(u64, Direction), usize>>>,
 }
 
 impl DiscoveryParser {
@@ -523,6 +534,10 @@ impl DiscoveryParser {
             .lock()
             .expect("pending requests poisoned")
             .retain(|id, _| !victims.contains(id));
+        self.skipped_bodies
+            .lock()
+            .expect("skipped bodies poisoned")
+            .retain(|(id, _), _| !victims.contains(id));
     }
 }
 
@@ -543,9 +558,19 @@ impl StreamParser for DiscoveryParser {
         let mut all = self.buffers.lock().expect("discovery buffers poisoned");
         let buffer = all.entry(key).or_default();
         buffer.extend_from_slice(data);
-        if buffer.len() > MAX_SCAN_BUFFER {
-            let drain = buffer.len() - MAX_SCAN_BUFFER;
-            buffer.drain(..drain);
+
+        // Walk past the remains of a body that was too large to assemble. Doing
+        // this by length keeps the next message correctly framed.
+        {
+            let mut skipped = self.skipped_bodies.lock().expect("skipped bodies poisoned");
+            if let Some(remaining) = skipped.get_mut(&key) {
+                let step = (*remaining).min(buffer.len());
+                buffer.drain(..step);
+                *remaining -= step;
+                if *remaining == 0 {
+                    skipped.remove(&key);
+                }
+            }
         }
 
         let mut messages = Vec::new();
@@ -579,6 +604,17 @@ impl StreamParser for DiscoveryParser {
                     .get("content-length")
                     .and_then(|v| v.parse::<usize>().ok())
                     .unwrap_or(0);
+                if total_headers + content_len > MAX_MESSAGE_BYTES {
+                    // Too large to hold. Drop the headers and remember how much
+                    // body to walk past, so the following messages still parse.
+                    let already_here = buffer.len().saturating_sub(total_headers);
+                    buffer.drain(..total_headers + already_here.min(content_len));
+                    self.skipped_bodies
+                        .lock()
+                        .expect("skipped bodies poisoned")
+                        .insert(key, content_len.saturating_sub(already_here));
+                    continue;
+                }
                 if buffer.len() < total_headers + content_len {
                     break;
                 }
@@ -710,6 +746,17 @@ impl StreamParser for DiscoveryParser {
                 None,
             ));
         }
+
+        // Only unframed data is capped. A message whose headers already arrived
+        // is allowed to finish - trimming the front here used to cut the
+        // statistics response in half and desynchronise everything after it.
+        if buffer.len() > MAX_MESSAGE_BYTES {
+            buffer.clear();
+        } else if find(buffer, b"\r\n\r\n").is_none() && buffer.len() > MAX_SCAN_BUFFER {
+            let drain = buffer.len() - MAX_SCAN_BUFFER;
+            buffer.drain(..drain);
+        }
+
         StreamParseResult::Complete {
             messages,
             bytes_consumed: data.len(),
@@ -1098,6 +1145,107 @@ mod tests {
             Some("api-gateway.asia.es-pio.net")
         );
         assert!(string_field(stats, "stats_body").is_some());
+    }
+
+    #[test]
+    fn reads_a_statistics_response_larger_than_the_scan_buffer() {
+        // The response grows with the account's history. Anything past the scan
+        // buffer used to be trimmed away mid-message and never parsed at all.
+        let parser = DiscoveryParser::default();
+        let context = StreamContext {
+            connection_id: 21,
+            direction: Direction::ToClient,
+            src_ip: "127.0.0.2".parse().unwrap(),
+            dst_ip: "127.0.0.1".parse().unwrap(),
+            src_port: 443,
+            dst_port: 50_000,
+            bytes_parsed: 0,
+            messages_parsed: 0,
+            alpn: None,
+        };
+        let rows: Vec<String> = (0..4_000)
+            .map(|index| format!(r#"{{"eventId":{index},"targetId":-{index},"amount":{index}}}"#))
+            .collect();
+        let body = format!(
+            r#"{{"scopedPlayerStats":[{{"playerStats":[{}]}}]}}"#,
+            rows.join(",")
+        );
+        assert!(
+            body.len() > MAX_SCAN_BUFFER,
+            "the fixture must exceed the scan buffer, got {} bytes",
+            body.len()
+        );
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nHost: api-gateway.europe.es-pio.net\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+            body.len()
+        );
+
+        // Arrives in pieces, the way a large body actually does.
+        let bytes = response.as_bytes();
+        let mut found = false;
+        for chunk in bytes.chunks(16 * 1024) {
+            if let StreamParseResult::Complete { messages, .. } =
+                parser.parse_stream(chunk, &context)
+                && messages.iter().any(|message| {
+                    string_field(message, "kind").as_deref() == Some("player_stats_response")
+                })
+            {
+                found = true;
+            }
+        }
+        assert!(
+            found,
+            "the oversized statistics response must still be read"
+        );
+    }
+
+    #[test]
+    fn stays_framed_when_a_body_is_too_large_to_assemble() {
+        let parser = DiscoveryParser::default();
+        let context = StreamContext {
+            connection_id: 22,
+            direction: Direction::ToClient,
+            src_ip: "127.0.0.2".parse().unwrap(),
+            dst_ip: "127.0.0.1".parse().unwrap(),
+            src_port: 443,
+            dst_port: 50_000,
+            bytes_parsed: 0,
+            messages_parsed: 0,
+            alpn: None,
+        };
+        let huge = MAX_MESSAGE_BYTES + 1;
+        parser.parse_stream(
+            format!(
+                "HTTP/1.1 200 OK\r\nHost: api-gateway.europe.es-pio.net\r\nContent-Length: {huge}\r\n\r\n"
+            )
+            .as_bytes(),
+            &context,
+        );
+        // The body never arrives in full; feed a slice of it and then a normal
+        // statistics response behind it.
+        let filler = vec![b'x'; 64 * 1024];
+        for _ in 0..4 {
+            parser.parse_stream(&filler, &context);
+        }
+        let remaining = huge - 4 * filler.len();
+        parser.parse_stream(&vec![b'x'; remaining], &context);
+
+        let body = r#"{"scopedPlayerStats":[]}"#;
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nHost: api-gateway.europe.es-pio.net\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+            body.len()
+        );
+        let StreamParseResult::Complete { messages, .. } =
+            parser.parse_stream(response.as_bytes(), &context)
+        else {
+            panic!("response was not parsed");
+        };
+        assert!(
+            messages.iter().any(|message| {
+                string_field(message, "kind").as_deref() == Some("player_stats_response")
+            }),
+            "the message after an oversized body must still be framed correctly"
+        );
     }
 
     #[test]

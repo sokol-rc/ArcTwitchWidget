@@ -1,4 +1,4 @@
-use std::io::{BufRead, BufReader, Read, Write};
+use std::io::{BufRead, BufReader, BufWriter, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::Path;
 use std::sync::Arc;
@@ -187,7 +187,7 @@ fn publish_service_address(address: &str) -> Result<()> {
         .with_context(|| format!("publishing capture service address to {}", path.display()))
 }
 
-fn serve_client(mut stream: TcpStream, service_stop: Arc<AtomicBool>) -> Result<()> {
+fn serve_client(stream: TcpStream, service_stop: Arc<AtomicBool>) -> Result<()> {
     stream.set_nodelay(true)?;
     stream.set_read_timeout(Some(Duration::from_secs(5)))?;
     let reader_stream = stream.try_clone()?;
@@ -210,12 +210,16 @@ fn serve_client(mut stream: TcpStream, service_stop: Arc<AtomicBool>) -> Result<
     authenticate_request(&request)?;
     request.auth_token.zeroize();
     let collector = start_local(request.keylog_path, true);
+    // Buffered on purpose: written straight to the socket with Nagle disabled,
+    // one statistics event left as hundreds of tiny segments, and a pause in
+    // the middle of that line cost the client the whole event.
+    let mut writer = BufWriter::new(stream);
     while !service_stop.load(Ordering::Relaxed) {
         match collector.events.recv_timeout(Duration::from_millis(250)) {
             Ok(event) => {
-                serde_json::to_writer(&mut stream, &event)?;
-                stream.write_all(b"\n")?;
-                stream.flush()?;
+                serde_json::to_writer(&mut writer, &event)?;
+                writer.write_all(b"\n")?;
+                writer.flush()?;
             }
             Err(crossbeam_channel::RecvTimeoutError::Timeout) => {}
             Err(crossbeam_channel::RecvTimeoutError::Disconnected) => break,

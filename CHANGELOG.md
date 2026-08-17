@@ -2,6 +2,14 @@
 
 All notable changes to ARC Live are documented here.
 
+## 0.20.0 - 2026-08-18
+
+- Read statistics responses larger than the scan buffer, which silently stopped capture for accounts with a long history.
+- Kept the stream framed when a body is too large to assemble, instead of losing the two responses that followed.
+- Stopped resetting the widget to the account preset after every response, so a user-defined preset stays selected.
+- Kept a partially received event from the capture service instead of dropping it on a read timeout.
+- Buffered the service's writes, so one event no longer leaves as hundreds of tiny segments.
+
 ## 0.19.0 - 2026-08-17
 
 - Recognised the statistics response by its own body, so a raid is no longer skipped when one earlier response was missed.

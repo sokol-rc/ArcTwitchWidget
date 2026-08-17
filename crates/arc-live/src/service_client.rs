@@ -114,20 +114,27 @@ impl RemoteCollector {
         let (tx, events) = bounded(256);
         let _ = tx.try_send(handshake);
         let worker = thread::spawn(move || {
+            // The line outlives the iteration on purpose: the read timeout can
+            // land in the middle of a long event, and dropping what already
+            // arrived would lose that event and desynchronise the next one.
+            let mut line = String::new();
             while !worker_stop.load(Ordering::Relaxed) {
-                let mut line = String::new();
                 match reader.read_line(&mut line) {
                     Ok(0) => break,
-                    Ok(_) => match serde_json::from_str::<CollectorEvent>(&line) {
-                        Ok(event) => {
-                            let _ = tx.try_send(event);
+                    Ok(_) if !line.ends_with('\n') => continue,
+                    Ok(_) => {
+                        match serde_json::from_str::<CollectorEvent>(&line) {
+                            Ok(event) => {
+                                let _ = tx.try_send(event);
+                            }
+                            Err(error) => {
+                                let _ = tx.try_send(CollectorEvent::Error(format!(
+                                    "Capture service returned invalid data: {error}"
+                                )));
+                            }
                         }
-                        Err(error) => {
-                            let _ = tx.try_send(CollectorEvent::Error(format!(
-                                "Capture service returned invalid data: {error}"
-                            )));
-                        }
-                    },
+                        line.clear();
+                    }
                     Err(error)
                         if matches!(
                             error.kind(),
