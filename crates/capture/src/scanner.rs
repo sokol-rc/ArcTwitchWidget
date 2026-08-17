@@ -33,6 +33,9 @@ const MAX_SCAN_BUFFER: usize = 128 * 1024;
 /// long-lived accounts, which silently stopped their capture; anything past
 /// this is walked past by length rather than cut out of the stream.
 const MAX_MESSAGE_BYTES: usize = 8 * 1024 * 1024;
+/// Everything the parser holds across all connections. A single large message
+/// is allowed, but not at the price of unbounded growth over a whole stream.
+const MAX_TOTAL_SCAN_BYTES: usize = 96 * 1024 * 1024;
 const MAX_DISCOVERY_CONNECTIONS: usize = 256;
 const MAX_PENDING_REQUESTS: usize = 16;
 /// How long a silent connection is kept. The game holds one HTTPS connection to
@@ -48,7 +51,9 @@ const MAX_TRACKED_API_CONNECTIONS: usize = 64;
 /// The one endpoint ARC Live reads. The game requests it on every return to the
 /// lobby; the response is recognised by its body as well as by this path.
 const PLAYER_STATS_PATH: &str = "/v1/pioneer/stats/player-v2";
-const MAX_DECODED_BODY: u64 = 4 * 1024 * 1024;
+/// Ceiling after decompression. It has to stay above [`MAX_MESSAGE_BYTES`],
+/// otherwise a response that frames correctly is still thrown away here.
+const MAX_DECODED_BODY: u64 = 32 * 1024 * 1024;
 const MAX_KEYLOG_WINDOW: u64 = 4 * 1024 * 1024;
 const MAX_CLIENT_RANDOMS: usize = 2_048;
 type StreamBuffers = Arc<Mutex<HashMap<(u64, Direction), Vec<u8>>>>;
@@ -604,7 +609,11 @@ impl StreamParser for DiscoveryParser {
                     .get("content-length")
                     .and_then(|v| v.parse::<usize>().ok())
                     .unwrap_or(0);
-                if total_headers + content_len > MAX_MESSAGE_BYTES {
+                // A forged or corrupt length must not overflow the arithmetic
+                // below - the slice indexing that follows would panic and take
+                // the capture thread with it.
+                let message_end = total_headers.saturating_add(content_len);
+                if message_end > MAX_MESSAGE_BYTES {
                     // Too large to hold. Drop the headers and remember how much
                     // body to walk past, so the following messages still parse.
                     let already_here = buffer.len().saturating_sub(total_headers);
@@ -615,7 +624,7 @@ impl StreamParser for DiscoveryParser {
                         .insert(key, content_len.saturating_sub(already_here));
                     continue;
                 }
-                if buffer.len() < total_headers + content_len {
+                if buffer.len() < message_end {
                     break;
                 }
                 (
@@ -629,13 +638,21 @@ impl StreamParser for DiscoveryParser {
             let mut host = headers.get("host").cloned().unwrap_or_default();
             if !host.is_empty() && is_allowed_host(&host) {
                 let mut hosts = self.hosts.lock().expect("discovery hosts poisoned");
-                // Connection ids grow monotonically, so the smallest one is the
-                // oldest API connection and the right thing to forget.
-                while hosts.len() >= MAX_TRACKED_API_CONNECTIONS
-                    && let Some(oldest) = hosts.keys().min().copied()
-                    && oldest != context.connection_id
-                {
-                    hosts.remove(&oldest);
+                // Forget the connection that has been quiet the longest, not
+                // the one with the smallest id: the game's keep-alive
+                // connection is the oldest by id and exactly the one to keep.
+                while hosts.len() >= MAX_TRACKED_API_CONNECTIONS {
+                    let last_seen = self.last_seen.lock().expect("last seen map poisoned");
+                    let Some(stalest) = hosts
+                        .keys()
+                        .filter(|id| **id != context.connection_id)
+                        .min_by_key(|id| last_seen.get(id).copied())
+                        .copied()
+                    else {
+                        break;
+                    };
+                    drop(last_seen);
+                    hosts.remove(&stalest);
                 }
                 hosts.insert(context.connection_id, host.clone());
             } else if status.is_some() {
@@ -704,10 +721,19 @@ impl StreamParser for DiscoveryParser {
             // lobby. The body itself is the reliable marker, so it decides, and
             // a disagreement resynchronises the queue instead of silently
             // mislabelling every later response.
+            // An empty scope is not the statistics: a truncated or unrelated
+            // answer would otherwise normalise to zeroes and wipe the stream
+            // counters, so the rows themselves have to be there.
             let body_is_player_stats = status.is_some()
-                && decoded_json
-                    .as_ref()
-                    .is_some_and(|value| value.get("scopedPlayerStats").is_some());
+                && decoded_json.as_ref().is_some_and(|value| {
+                    value
+                        .get("scopedPlayerStats")
+                        .and_then(Value::as_array)
+                        .and_then(|scopes| scopes.first())
+                        .and_then(|scope| scope.get("playerStats"))
+                        .and_then(Value::as_array)
+                        .is_some_and(|rows| !rows.is_empty())
+                });
             if body_is_player_stats && !path_is_player_stats {
                 method = Some("POST".to_owned());
                 path = Some(PLAYER_STATS_PATH.to_owned());
@@ -752,9 +778,29 @@ impl StreamParser for DiscoveryParser {
         // statistics response in half and desynchronise everything after it.
         if buffer.len() > MAX_MESSAGE_BYTES {
             buffer.clear();
-        } else if find(buffer, b"\r\n\r\n").is_none() && buffer.len() > MAX_SCAN_BUFFER {
+        } else if buffer.len() > MAX_SCAN_BUFFER && find(buffer, b"\r\n\r\n").is_none() {
             let drain = buffer.len() - MAX_SCAN_BUFFER;
             buffer.drain(..drain);
+        }
+        // Letting a single message grow keeps the parser honest, but the sum of
+        // every connection still has to stay bounded on a machine that runs for
+        // a whole stream. The greediest stranger is dropped first.
+        if all
+            .get(&key)
+            .is_some_and(|buffer| buffer.len() > MAX_SCAN_BUFFER)
+        {
+            let mut total: usize = all.values().map(Vec::len).sum();
+            while total > MAX_TOTAL_SCAN_BYTES {
+                let Some(fattest) = all
+                    .iter()
+                    .filter(|(other, _)| **other != key)
+                    .max_by_key(|(_, buffer)| buffer.len())
+                    .map(|(other, _)| *other)
+                else {
+                    break;
+                };
+                total -= all.remove(&fattest).map_or(0, |buffer| buffer.len());
+            }
         }
 
         StreamParseResult::Complete {
@@ -1123,7 +1169,7 @@ mod tests {
             dst_port: request_context.src_port,
             ..request_context
         };
-        let body = br#"{"scopedPlayerStats":[]}"#;
+        let body = br#"{"scopedPlayerStats":[{"playerStats":[{"eventId":9800,"amount":1}]}]}"#;
         let response = format!(
             "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
             body.len(),
@@ -1230,7 +1276,7 @@ mod tests {
         let remaining = huge - 4 * filler.len();
         parser.parse_stream(&vec![b'x'; remaining], &context);
 
-        let body = r#"{"scopedPlayerStats":[]}"#;
+        let body = r#"{"scopedPlayerStats":[{"playerStats":[{"eventId":9800,"amount":1}]}]}"#;
         let response = format!(
             "HTTP/1.1 200 OK\r\nHost: api-gateway.europe.es-pio.net\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
             body.len()
@@ -1293,7 +1339,7 @@ mod tests {
         );
 
         // Only the statistics answer comes back; the two before it were missed.
-        let body = br#"{"scopedPlayerStats":[]}"#;
+        let body = br#"{"scopedPlayerStats":[{"playerStats":[{"eventId":9800,"amount":1}]}]}"#;
         let response = format!(
             "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
             body.len(),

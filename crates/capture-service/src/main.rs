@@ -190,6 +190,9 @@ fn publish_service_address(address: &str) -> Result<()> {
 fn serve_client(stream: TcpStream, service_stop: Arc<AtomicBool>) -> Result<()> {
     stream.set_nodelay(true)?;
     stream.set_read_timeout(Some(Duration::from_secs(5)))?;
+    // Without this a client that stopped reading blocks the write forever, and
+    // with it the whole service: the accept loop is single-threaded.
+    stream.set_write_timeout(Some(Duration::from_secs(30)))?;
     let reader_stream = stream.try_clone()?;
     let mut reader = BufReader::new(reader_stream);
     let mut request_line = String::new();
@@ -214,10 +217,22 @@ fn serve_client(stream: TcpStream, service_stop: Arc<AtomicBool>) -> Result<()> 
     // one statistics event left as hundreds of tiny segments, and a pause in
     // the middle of that line cost the client the whole event.
     let mut writer = BufWriter::new(stream);
+    // The capture has to be stopped whatever happens here: leaving it running
+    // would keep the driver open and let the next client start a second one.
+    let result = forward_events(&collector, &mut writer, &service_stop);
+    collector.stop();
+    result
+}
+
+fn forward_events(
+    collector: &arc_live_collector::CollectorHandle,
+    writer: &mut BufWriter<TcpStream>,
+    service_stop: &AtomicBool,
+) -> Result<()> {
     while !service_stop.load(Ordering::Relaxed) {
         match collector.events.recv_timeout(Duration::from_millis(250)) {
             Ok(event) => {
-                serde_json::to_writer(&mut writer, &event)?;
+                serde_json::to_writer(&mut *writer, &event)?;
                 writer.write_all(b"\n")?;
                 writer.flush()?;
             }
@@ -225,7 +240,6 @@ fn serve_client(stream: TcpStream, service_stop: Arc<AtomicBool>) -> Result<()> 
             Err(crossbeam_channel::RecvTimeoutError::Disconnected) => break,
         }
     }
-    collector.stop();
     Ok(())
 }
 

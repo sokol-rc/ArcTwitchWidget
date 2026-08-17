@@ -9,6 +9,13 @@ All notable changes to ARC Live are documented here.
 - Stopped resetting the widget to the account preset after every response, so a user-defined preset stays selected.
 - Kept a partially received event from the capture service instead of dropping it on a read timeout.
 - Buffered the service's writes, so one event no longer leaves as hundreds of tiny segments.
+- Kept counting while the window is minimised; everything but drawing now runs regardless of the window.
+- Reconnected to the capture service on its own after the connection is lost, instead of staying silent until a restart.
+- Said plainly when the background capture has stopped, rather than still showing the game as connected.
+- Ignored an empty statistics answer instead of zeroing the stream counters with it.
+- Kept the game's connection when the tracked list is full by dropping the quietest one instead of the oldest.
+- Bounded what the parser holds across all connections, and stopped a forged content length from crashing capture.
+- Stopped losing the running/stopped state of the game when the UI was busy.
 
 ## 0.19.0 - 2026-08-17
 

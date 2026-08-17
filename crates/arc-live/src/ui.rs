@@ -503,8 +503,18 @@ impl ArcLiveApp {
                     }
                 }
                 CollectorEvent::Stopped => {
-                    let mut state = self.state.write().expect("state poisoned");
-                    state.record("warning", "Capture stopped");
+                    // The stream is over for good: say so instead of leaving
+                    // "Игра подключена" on screen with nothing behind it.
+                    self.collector_ready = false;
+                    {
+                        let mut state = self.state.write().expect("state poisoned");
+                        state.record("warning", "Capture stopped");
+                        state.stats_stream_ready = false;
+                    }
+                    self.record_user_event(
+                        "warning",
+                        "Фоновый компонент захвата остановлен — перезапустите ARC Live",
+                    );
                 }
             }
             self.state.write().expect("state poisoned").last_update = Utc::now();
@@ -1034,51 +1044,52 @@ impl ArcLiveApp {
 }
 
 impl eframe::App for ArcLiveApp {
+    /// Everything that must keep running whether or not the window is drawn.
+    /// eframe skips [`Self::ui`] entirely for a minimised or hidden window and
+    /// calls only this, so keeping the statistics here is what lets a streamer
+    /// minimise ARC Live without the widget freezing.
+    fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        // A second launch hands activation to the running instance instead of
+        // starting a new one; bring the window back to the front.
+        while self.instance.activation.try_recv().is_ok() {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+            ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+        }
+        if let Some(action) = self.tray.as_ref().and_then(TrayController::poll) {
+            match action {
+                TrayAction::Show => {
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+                }
+                TrayAction::Exit => ctx.send_viewport_cmd(egui::ViewportCommand::Close),
+            }
+        }
+        self.updates.drain();
+        if self.config.disclaimer_accepted_revision >= DISCLAIMER_REVISION {
+            self.rollover_day_if_needed();
+        }
+        self.drain_events();
+        ctx.request_repaint_after(Duration::from_millis(250));
+    }
+
     fn ui(&mut self, root: &mut egui::Ui, _frame: &mut eframe::Frame) {
         if !self.theme_installed {
             view::install_theme(root.ctx());
             self.theme_installed = true;
         }
-        // A second launch hands activation to the running instance instead of
-        // starting a new one; bring the window back to the front.
-        while self.instance.activation.try_recv().is_ok() {
-            root.ctx()
-                .send_viewport_cmd(egui::ViewportCommand::Visible(true));
-            root.ctx().send_viewport_cmd(egui::ViewportCommand::Focus);
-        }
-        if let Some(action) = self.tray.as_ref().and_then(TrayController::poll) {
-            match action {
-                TrayAction::Show => {
-                    root.ctx()
-                        .send_viewport_cmd(egui::ViewportCommand::Visible(true));
-                    root.ctx().send_viewport_cmd(egui::ViewportCommand::Focus);
-                }
-                TrayAction::Exit => {
-                    root.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
-                }
-            }
-        }
-        self.updates.drain();
         // The risk notice comes before anything else, including onboarding, and
         // returns after an update that raises the revision.
         if self.config.disclaimer_accepted_revision < DISCLAIMER_REVISION {
-            self.drain_events();
             let actions = view::disclaimer(root, self.disclaimer_confirmed);
             for action in actions {
                 self.apply(action, root.ctx());
             }
-            root.ctx().request_repaint_after(Duration::from_millis(250));
             return;
         }
         if !self.config.onboarding_completed {
-            self.drain_events();
             self.onboarding_ui(root);
-            root.ctx().request_repaint_after(Duration::from_millis(250));
             return;
         }
-        self.rollover_day_if_needed();
-        self.drain_events();
-        root.ctx().request_repaint_after(Duration::from_millis(250));
 
         let snapshot = self.state.read().expect("state poisoned").clone();
         let events: Vec<EventView> = self

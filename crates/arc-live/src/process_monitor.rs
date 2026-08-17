@@ -42,8 +42,10 @@ impl ProcessMonitor {
                         keylog_path: None,
                     }
                 };
-                if previous.as_ref() != Some(&status) {
-                    let _ = tx.try_send(status.clone());
+                // Only remember what was actually delivered. A change dropped
+                // into a full channel is never repeated, and the game would
+                // stay reported as running - or not running - for good.
+                if previous.as_ref() != Some(&status) && tx.try_send(status.clone()).is_ok() {
                     previous = Some(status);
                 }
                 for _ in 0..50 {

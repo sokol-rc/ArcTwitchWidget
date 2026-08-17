@@ -4,7 +4,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Result, ensure};
 use arc_live_collector::{
@@ -48,8 +48,16 @@ pub struct RemoteCollector {
     worker: Option<thread::JoinHandle<()>>,
 }
 
+/// How long to wait before reaching for the service again after a lost
+/// connection. The service is restarted by every update, so a session that
+/// cannot come back on its own would leave the widget frozen for the stream.
+const RECONNECT_DELAY: Duration = Duration::from_secs(3);
+/// A single event never comes close to this; anything larger means the stream
+/// is out of step, and starting a fresh line beats growing without end.
+const MAX_EVENT_BYTES: usize = 32 * 1024 * 1024;
+
 impl RemoteCollector {
-    fn connect(keylog_path: PathBuf, auth_token: String) -> Result<Self> {
+    fn open(keylog_path: PathBuf, auth_token: String) -> Result<(BufReader<TcpStream>, TcpStream)> {
         let mut addresses = Vec::new();
         if let Some(path) = service_address_file()
             && let Ok(value) = std::fs::read_to_string(path)
@@ -109,42 +117,93 @@ impl RemoteCollector {
         reader
             .get_ref()
             .set_read_timeout(Some(Duration::from_millis(500)))?;
+        Ok((reader, socket))
+    }
+
+    fn connect(keylog_path: PathBuf, auth_token: String) -> Result<Self> {
+        let (mut reader, socket) = Self::open(keylog_path.clone(), auth_token.clone())?;
         let stop = Arc::new(AtomicBool::new(false));
         let worker_stop = Arc::clone(&stop);
         let (tx, events) = bounded(256);
-        let _ = tx.try_send(handshake);
         let worker = thread::spawn(move || {
-            // The line outlives the iteration on purpose: the read timeout can
-            // land in the middle of a long event, and dropping what already
-            // arrived would lose that event and desynchronise the next one.
-            let mut line = String::new();
-            while !worker_stop.load(Ordering::Relaxed) {
-                match reader.read_line(&mut line) {
-                    Ok(0) => break,
-                    Ok(_) if !line.ends_with('\n') => continue,
-                    Ok(_) => {
-                        match serde_json::from_str::<CollectorEvent>(&line) {
-                            Ok(event) => {
-                                let _ = tx.try_send(event);
+            // Bytes, not a String, and kept across iterations: the read timeout
+            // can land in the middle of an event - even in the middle of a
+            // multi-byte character - and anything already read would otherwise
+            // be thrown away, taking the event and the framing with it.
+            let mut line = Vec::new();
+            'session: while !worker_stop.load(Ordering::Relaxed) {
+                while !worker_stop.load(Ordering::Relaxed) {
+                    match reader.read_until(b'\n', &mut line) {
+                        Ok(0) => break,
+                        Ok(_) if !line.ends_with(b"\n") => continue,
+                        Ok(_) => {
+                            match std::str::from_utf8(&line)
+                                .map_err(|error| error.to_string())
+                                .and_then(|text| {
+                                    serde_json::from_str::<CollectorEvent>(text)
+                                        .map_err(|error| error.to_string())
+                                }) {
+                                Ok(event) => {
+                                    let _ = tx.try_send(event);
+                                }
+                                Err(error) => {
+                                    let _ = tx.try_send(CollectorEvent::Error(format!(
+                                        "Capture service returned invalid data: {error}"
+                                    )));
+                                }
                             }
-                            Err(error) => {
-                                let _ = tx.try_send(CollectorEvent::Error(format!(
-                                    "Capture service returned invalid data: {error}"
-                                )));
-                            }
+                            line.clear();
                         }
+                        Err(error)
+                            if matches!(
+                                error.kind(),
+                                std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                            ) => {}
+                        Err(error) => {
+                            let _ = tx.try_send(CollectorEvent::Error(format!(
+                                "Capture service connection failed: {error}"
+                            )));
+                            break;
+                        }
+                    }
+                    if line.len() > MAX_EVENT_BYTES {
+                        let _ = tx.try_send(CollectorEvent::Error(
+                            "Capture service sent an oversized event; resynchronising".to_owned(),
+                        ));
                         line.clear();
                     }
-                    Err(error)
-                        if matches!(
-                            error.kind(),
-                            std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
-                        ) => {}
-                    Err(error) => {
-                        let _ = tx.try_send(CollectorEvent::Error(format!(
-                            "Capture service connection failed: {error}"
-                        )));
-                        break;
+                }
+                if worker_stop.load(Ordering::Relaxed) {
+                    break;
+                }
+                // The connection is gone. Every update restarts the service, so
+                // the only useful answer is to keep reaching for it rather than
+                // leaving the widget frozen for the rest of the stream.
+                let _ = tx.try_send(CollectorEvent::Status(
+                    "Capture service connection lost, reconnecting".to_owned(),
+                ));
+                loop {
+                    let deadline = Instant::now() + RECONNECT_DELAY;
+                    while Instant::now() < deadline {
+                        if worker_stop.load(Ordering::Relaxed) {
+                            break 'session;
+                        }
+                        thread::sleep(Duration::from_millis(100));
+                    }
+                    match Self::open(keylog_path.clone(), auth_token.clone()) {
+                        Ok((fresh, _)) => {
+                            reader = fresh;
+                            line.clear();
+                            let _ = tx.try_send(CollectorEvent::Status(
+                                "Capture service connection restored".to_owned(),
+                            ));
+                            continue 'session;
+                        }
+                        Err(error) => {
+                            let _ = tx.try_send(CollectorEvent::Error(format!(
+                                "Reconnecting to the capture service failed: {error:#}"
+                            )));
+                        }
                     }
                 }
             }
