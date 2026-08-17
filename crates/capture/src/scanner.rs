@@ -27,7 +27,16 @@ use crate::source::{PacketSource, SourceControl};
 const MAX_SCAN_BUFFER: usize = 128 * 1024;
 const MAX_DISCOVERY_CONNECTIONS: usize = 256;
 const MAX_PENDING_REQUESTS: usize = 16;
-const DISCOVERY_CONNECTION_TIMEOUT: Duration = Duration::from_secs(120);
+/// How long a silent connection is kept. The game holds one HTTPS connection to
+/// its API open across a whole raid and reuses it for the statistics request on
+/// the way back to Speranza. Dropping it while the player is in a raid loses the
+/// TLS state, so the response that finally arrives cannot be decrypted and the
+/// stream counters silently stop. The window therefore has to outlast a raid.
+const CONNECTION_IDLE_TIMEOUT: Duration = Duration::from_secs(45 * 60);
+const DISCOVERY_CONNECTION_TIMEOUT: Duration = CONNECTION_IDLE_TIMEOUT;
+/// Connections to the game's API are never evicted to make room for others.
+/// Their number is still bounded, so a long stream cannot grow the map forever.
+const MAX_TRACKED_API_CONNECTIONS: usize = 64;
 const MAX_DECODED_BODY: u64 = 4 * 1024 * 1024;
 const MAX_KEYLOG_WINDOW: u64 = 4 * 1024 * 1024;
 const MAX_CLIENT_RANDOMS: usize = 2_048;
@@ -159,7 +168,7 @@ fn capture_loop(
         ..Default::default()
     };
     let mut signature = None;
-    let mut manager = build_manager(load_keylog(keylog_path, &mut stats)?);
+    let (mut manager, api_connections) = build_manager(load_keylog(keylog_path, &mut stats)?);
     let mut frame = 0u64;
     let mut last_key_check = Instant::now();
     let mut last_stats = Instant::now();
@@ -232,6 +241,20 @@ fn capture_loop(
             stats.connections_evicted = stats
                 .connections_evicted
                 .saturating_add(removed.len() as u64);
+            // Losing one of these is the only way a working capture can go
+            // quiet mid-stream, so it is reported instead of passing silently.
+            if !removed.is_empty() {
+                let mut hosts = api_connections.lock().expect("discovery hosts poisoned");
+                for connection in &removed {
+                    if let Some(host) = hosts.remove(&connection.id) {
+                        tx.try_send(CaptureEvent::Status(format!(
+                            "Idle connection to {host} timed out; the next statistics response on \
+                             it cannot be decrypted"
+                        )))
+                        .ok();
+                    }
+                }
+            }
             last_cleanup = Instant::now();
         }
 
@@ -247,15 +270,19 @@ fn capture_loop(
     Ok(())
 }
 
-fn build_manager(keylog: KeyLog) -> StreamManager {
+/// Returns the manager together with the map of connections that talk to the
+/// game's API, so the capture loop can tell when one of them is dropped.
+fn build_manager(keylog: KeyLog) -> (StreamManager, Arc<Mutex<HashMap<u64, String>>>) {
     let mut manager = StreamManager::new(StreamConfig {
         max_connection_buffer: 8 * 1024 * 1024,
         max_total_memory: 64 * 1024 * 1024,
-        connection_timeout_us: 60_000_000,
+        connection_timeout_us: CONNECTION_IDLE_TIMEOUT.as_micros() as i64,
     })
     .with_keylog(keylog);
-    manager.registry_mut().register(DiscoveryParser::default());
-    manager
+    let parser = DiscoveryParser::default();
+    let hosts = Arc::clone(&parser.hosts);
+    manager.registry_mut().register(parser);
+    (manager, hosts)
 }
 
 fn process_segment(
@@ -434,6 +461,15 @@ impl DiscoveryParser {
     fn touch_and_prune(&self, connection_id: u64) {
         let now = Instant::now();
         let count = self.parse_count.fetch_add(1, Ordering::Relaxed);
+        // The host map only ever holds connections to the game's API, so it is
+        // exactly the set that must survive a quiet raid.
+        let protected: HashSet<u64> = self
+            .hosts
+            .lock()
+            .expect("discovery hosts poisoned")
+            .keys()
+            .copied()
+            .collect();
         let victims = {
             let mut last_seen = self.last_seen.lock().expect("last seen map poisoned");
             last_seen.insert(connection_id, now);
@@ -444,7 +480,8 @@ impl DiscoveryParser {
             let mut victims: HashSet<u64> = last_seen
                 .iter()
                 .filter_map(|(id, seen_at)| {
-                    (now.saturating_duration_since(*seen_at) > DISCOVERY_CONNECTION_TIMEOUT)
+                    (!protected.contains(id)
+                        && now.saturating_duration_since(*seen_at) > DISCOVERY_CONNECTION_TIMEOUT)
                         .then_some(*id)
                 })
                 .collect();
@@ -453,6 +490,7 @@ impl DiscoveryParser {
             if last_seen.len() > MAX_DISCOVERY_CONNECTIONS {
                 let mut oldest: Vec<_> = last_seen
                     .iter()
+                    .filter(|(id, _)| !protected.contains(id))
                     .map(|(id, seen_at)| (*id, *seen_at))
                     .collect();
                 oldest.sort_unstable_by_key(|(_, seen_at)| *seen_at);
@@ -551,10 +589,16 @@ impl StreamParser for DiscoveryParser {
             let (mut method, mut path, status) = parse_start_line(first);
             let mut host = headers.get("host").cloned().unwrap_or_default();
             if !host.is_empty() && is_allowed_host(&host) {
-                self.hosts
-                    .lock()
-                    .expect("discovery hosts poisoned")
-                    .insert(context.connection_id, host.clone());
+                let mut hosts = self.hosts.lock().expect("discovery hosts poisoned");
+                // Connection ids grow monotonically, so the smallest one is the
+                // oldest API connection and the right thing to forget.
+                while hosts.len() >= MAX_TRACKED_API_CONNECTIONS
+                    && let Some(oldest) = hosts.keys().min().copied()
+                    && oldest != context.connection_id
+                {
+                    hosts.remove(&oldest);
+                }
+                hosts.insert(context.connection_id, host.clone());
             } else if status.is_some() {
                 host = self
                     .hosts
@@ -1107,6 +1151,86 @@ mod tests {
                 .expect("discovery buffers poisoned")
                 .len()
                 <= MAX_DISCOVERY_CONNECTIONS
+        );
+    }
+
+    #[test]
+    fn keeps_the_game_api_connection_while_other_traffic_floods_in() {
+        fn context(connection_id: u64) -> StreamContext {
+            StreamContext {
+                connection_id,
+                direction: Direction::ToServer,
+                src_ip: "127.0.0.1".parse().unwrap(),
+                dst_ip: "127.0.0.2".parse().unwrap(),
+                src_port: 50_000,
+                dst_port: 443,
+                bytes_parsed: 0,
+                messages_parsed: 0,
+                alpn: None,
+            }
+        }
+
+        // The game asks for its statistics once, then goes quiet for a raid
+        // while the rest of the machine keeps opening connections.
+        let parser = DiscoveryParser::default();
+        let game = 1u64;
+        parser.parse_stream(
+            b"POST /v1/pioneer/stats/player-v2 HTTP/1.1\r\nHost: api-gateway.europe.es-pio.net\r\nContent-Length: 0\r\n\r\n",
+            &context(game),
+        );
+        assert!(
+            parser
+                .hosts
+                .lock()
+                .expect("discovery hosts poisoned")
+                .contains_key(&game)
+        );
+
+        for connection_id in 2..=(MAX_DISCOVERY_CONNECTIONS as u64 + 500) {
+            parser.parse_stream(b"incomplete", &context(connection_id));
+        }
+
+        assert!(
+            parser
+                .last_seen
+                .lock()
+                .expect("last seen map poisoned")
+                .contains_key(&game),
+            "the connection carrying the statistics must survive the flood"
+        );
+        assert!(
+            parser
+                .hosts
+                .lock()
+                .expect("discovery hosts poisoned")
+                .contains_key(&game)
+        );
+    }
+
+    #[test]
+    fn bounds_the_number_of_tracked_api_connections() {
+        let parser = DiscoveryParser::default();
+        for connection_id in 1..=(MAX_TRACKED_API_CONNECTIONS as u64 * 2) {
+            parser.parse_stream(
+                b"POST /v1/pioneer/stats/player-v2 HTTP/1.1\r\nHost: api-gateway.europe.es-pio.net\r\nContent-Length: 0\r\n\r\n",
+                &StreamContext {
+                    connection_id,
+                    direction: Direction::ToServer,
+                    src_ip: "127.0.0.1".parse().unwrap(),
+                    dst_ip: "127.0.0.2".parse().unwrap(),
+                    src_port: 50_000,
+                    dst_port: 443,
+                    bytes_parsed: 0,
+                    messages_parsed: 0,
+                    alpn: None,
+                },
+            );
+        }
+        let hosts = parser.hosts.lock().expect("discovery hosts poisoned");
+        assert!(hosts.len() <= MAX_TRACKED_API_CONNECTIONS);
+        assert!(
+            hosts.contains_key(&(MAX_TRACKED_API_CONNECTIONS as u64 * 2)),
+            "the newest API connection must always be tracked"
         );
     }
 }

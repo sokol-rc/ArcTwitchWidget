@@ -156,6 +156,13 @@ Two font notes that already caused bugs: the bundled font has no `●`/`◉` gly
 - **Bounded everything.** Decoded bodies 4 MiB, keylog window 4 MiB, connection /
   pending-request / client-random caps in `scanner.rs`, row caps in `storage`.
   Keep new buffers bounded - this process runs for a whole stream.
+- **Idle connections must outlive a raid.** The game keeps one HTTPS connection
+  to its API open across a whole raid and reuses it for the stats request on the
+  way back to Speranza. Evicting it loses the TLS state, and the response can no
+  longer be decrypted - the counters then stop silently. Hence
+  `CONNECTION_IDLE_TIMEOUT` (45 min) in `scanner.rs`, and connections in the
+  discovery `hosts` map (only ever allowlisted API hosts) are exempt from the
+  LRU cap. Do not lower the window to save memory.
 - **Message language split.** `AppState::record` / `tracing` messages are English
   (internal, ends up in diagnostics); `ArcLiveApp::record_user_event` and all egui
   strings are Russian (user-facing). Match the surrounding call.

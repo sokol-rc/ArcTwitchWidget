@@ -2,6 +2,12 @@
 
 All notable changes to ARC Live are documented here.
 
+## 0.18.0 - 2026-08-17
+
+- Kept the game's API connection alive across a whole raid, so statistics update after every raid instead of only at login.
+- Protected that connection from being evicted by unrelated traffic.
+- Reported in the activity log when such a connection is dropped, instead of going quiet.
+
 ## 0.17.0 - 2026-08-16
 
 - Scaled the OBS widget to the size of its Browser Source, so enlarging it no longer blurs the text.
