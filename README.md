@@ -1,13 +1,35 @@
 # ARC Live
 
-> **Research status — not approved for public distribution.** This build relies
-> on passive packet inspection of ARC Raiders traffic.
-> Embark has not authorized this integration. Do not distribute or use it on a
-> production account until an approved data source or written permission is
-> available.
+## Disclaimer
 
-See the current production audit in
-[`docs/PRODUCTION_READINESS_RU.md`](docs/PRODUCTION_READINESS_RU.md).
+**ARC Live is an independent hobby project. It is not affiliated with,
+endorsed by, or supported by Embark Studios. ARC Raiders and all game
+materials belong to Embark Studios.**
+
+This is a research build. To produce statistics, ARC Live decrypts and reads
+the game's own network responses on the local machine. The game's terms of
+service prohibit interception and analysis of its network protocol, and the
+anti-cheat may treat any third-party software running alongside the game as a
+violation.
+
+**Using ARC Live may therefore get your account banned — temporarily or
+permanently, up to losing everything you bought and played for. Nobody can
+promise otherwise.**
+
+The software is provided as is, without any warranty. The author accepts no
+liability for account bans, lost progress, or any other damage. You use it at
+your own risk. If the account matters to you, do not use ARC Live on it.
+
+What ARC Live does not do:
+
+- it does not modify game files and does not read game memory;
+- it does not automate input and gives no advantage in combat;
+- it does not send statistics, keys, or tokens anywhere;
+- it does not call Embark servers on its own behalf.
+
+See the production audit in
+[`docs/PRODUCTION_READINESS_RU.md`](docs/PRODUCTION_READINESS_RU.md) for the
+full legal and technical assessment.
 
 [![CI](https://github.com/sokol-rc/ArcTwitchWidget/actions/workflows/ci.yml/badge.svg)](https://github.com/sokol-rc/ArcTwitchWidget/actions/workflows/ci.yml)
 [![Release](https://github.com/sokol-rc/ArcTwitchWidget/actions/workflows/release.yml/badge.svg)](https://github.com/sokol-rc/ArcTwitchWidget/actions/workflows/release.yml)

@@ -2,6 +2,13 @@
 
 All notable changes to ARC Live are documented here.
 
+## 0.16.0 - 2026-08-16
+
+- Added a risk notice that must be confirmed before the application can be used.
+- Repeated the notice on the settings screen, in the installer and in the readme.
+- Stated plainly that the project is independent of Embark Studios and that an account may be banned.
+- Reshowed the notice after an update whenever its wording changes materially.
+
 ## 0.15.0 - 2026-08-16
 
 - Added the ARC Live icon to the executable, the window, the taskbar, the tray, the Start menu shortcut and the installer.

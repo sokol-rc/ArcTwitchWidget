@@ -9,6 +9,10 @@ pub const DEFAULT_STABLE_UPDATE_FEED_URL: &str =
 pub const DEFAULT_BETA_UPDATE_FEED_URL: &str =
     "https://github.com/sokol-rc/ArcTwitchWidget/releases/download/beta/beta.json";
 
+/// Current revision of the risk notice shown before the application can be
+/// used. Bump it whenever the wording changes materially.
+pub const DISCLAIMER_REVISION: u8 = 1;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct AppConfig {
@@ -23,6 +27,9 @@ pub struct AppConfig {
     pub overlay_blur: u8,
     pub game_process_names: Vec<String>,
     pub onboarding_completed: bool,
+    /// Which revision of the risk notice the user has confirmed. Raising
+    /// [`DISCLAIMER_REVISION`] shows the notice again after an update.
+    pub disclaimer_accepted_revision: u8,
     pub update_channel: String,
     pub automatic_updates: bool,
     pub update_feed_url: String,
@@ -48,6 +55,7 @@ impl Default for AppConfig {
                 "ArcRaiders-Win64-Shipping.exe".into(),
             ],
             onboarding_completed: false,
+            disclaimer_accepted_revision: 0,
             update_channel: "stable".into(),
             automatic_updates: true,
             update_feed_url: option_env!("ARC_LIVE_UPDATE_FEED_URL")

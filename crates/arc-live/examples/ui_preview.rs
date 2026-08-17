@@ -55,6 +55,7 @@ fn main() -> eframe::Result<()> {
             (Page::Widget, "02-widget"),
             (Page::Settings, "03-settings"),
             (Page::Stream, "04-stream-no-keys"),
+            (Page::Stream, "05-disclaimer"),
         ],
         index: 0,
         frames_on_page: 0,
@@ -104,6 +105,12 @@ impl eframe::App for Preview {
             return;
         };
 
+        if name == "05-disclaimer" {
+            let _ = arc_live::view::disclaimer(root, false);
+            self.capture_frame(root, name);
+            return;
+        }
+
         let model = ViewModel {
             page,
             version: "0.14.0",
@@ -146,8 +153,13 @@ impl eframe::App for Preview {
             preset_error: None,
         };
         let _ = render(root, &model);
+        self.capture_frame(root, name);
+    }
+}
 
-        // Give egui a few frames to settle the layout, then grab the frame.
+impl Preview {
+    /// Gives egui a few frames to settle the layout, then grabs the frame.
+    fn capture_frame(&mut self, root: &egui::Ui, name: &str) {
         self.frames_on_page += 1;
         if self.frames_on_page > 3 && !self.requested {
             self.requested = true;

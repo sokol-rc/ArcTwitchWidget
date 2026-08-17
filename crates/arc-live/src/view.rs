@@ -72,6 +72,85 @@ pub fn capture_problem(
     }
 }
 
+/// The risk notice, shown before first use and repeated in "О программе".
+/// Кратко и честно: метод работы приложения прямо запрещён соглашением игры.
+pub const DISCLAIMER_TITLE: &str = "Прочитайте до начала работы";
+pub const DISCLAIMER_PARAGRAPHS: [&str; 4] = [
+    "ARC Live - независимый любительский проект. Он не связан с Embark Studios, \
+     не одобрен и не поддерживается ими. ARC Raiders и все материалы игры принадлежат \
+     Embark Studios.",
+    "Это исследовательская сборка. Чтобы посчитать статистику, ARC Live расшифровывает \
+     и читает сетевые ответы игры на вашем компьютере. Пользовательское соглашение игры \
+     запрещает перехват и анализ её сетевого протокола, а античит может счесть нарушением \
+     любую стороннюю программу рядом с игрой.",
+    "Из этого следует главное: использование ARC Live может привести к блокировке аккаунта - \
+     временной или постоянной, вплоть до потери всего купленного и пройденного. \
+     Гарантий, что этого не произойдёт, никто дать не может.",
+    "Программа поставляется как есть. Автор не несёт ответственности за блокировку аккаунта, \
+     потерю прогресса и любой другой ущерб. Вы используете её на свой страх и риск. \
+     Если аккаунт вам дорог - не используйте ARC Live на нём.",
+];
+/// What the application deliberately does not do. Kept next to the warning so
+/// the picture is complete rather than one-sided.
+pub const DISCLAIMER_LIMITS: [&str; 4] = [
+    "не изменяет файлы игры и не читает её память",
+    "не управляет вводом и не даёт преимущества в бою",
+    "не отправляет наружу ни статистику, ни ключи, ни токены",
+    "не обращается к серверам Embark от своего имени",
+];
+pub const DISCLAIMER_CONFIRMATION: &str = "Я прочитал, понимаю риск блокировки и принимаю его";
+
+/// Draws the risk notice that gates the first run. Returns the actions the
+/// user asked for; the caller owns both the checkbox state and the decision.
+pub fn disclaimer(ui: &mut egui::Ui, confirmed: bool) -> Vec<Action> {
+    let mut actions = Vec::new();
+    egui::CentralPanel::default()
+        .frame(panel_frame(ui, 22, 18))
+        .show(ui, |ui| {
+            egui::ScrollArea::vertical()
+                .auto_shrink([false, false])
+                .show(ui, |ui| {
+                    ui.label(
+                        RichText::new(DISCLAIMER_TITLE)
+                            .size(26.0)
+                            .strong()
+                            .color(COLOR_LOOT),
+                    );
+                    ui.add_space(14.0);
+                    for paragraph in DISCLAIMER_PARAGRAPHS {
+                        ui.label(RichText::new(paragraph).size(15.0));
+                        ui.add_space(10.0);
+                    }
+                    ui.add_space(4.0);
+                    card(ui, |ui| {
+                        ui.label(RichText::new("Что ARC Live не делает:").strong());
+                        ui.add_space(4.0);
+                        for limit in DISCLAIMER_LIMITS {
+                            ui.label(RichText::new(format!("• {limit}")).color(COLOR_MUTED));
+                        }
+                    });
+                    ui.add_space(16.0);
+                    let mut checked = confirmed;
+                    if ui.checkbox(&mut checked, DISCLAIMER_CONFIRMATION).changed() {
+                        actions.push(Action::ConfirmDisclaimer(checked));
+                    }
+                    ui.add_space(12.0);
+                    ui.horizontal(|ui| {
+                        if ui
+                            .add_enabled(confirmed, egui::Button::new("Продолжить"))
+                            .clicked()
+                        {
+                            actions.push(Action::AcceptDisclaimer);
+                        }
+                        if ui.button("Закрыть программу").clicked() {
+                            actions.push(Action::DeclineDisclaimer);
+                        }
+                    });
+                });
+        });
+    actions
+}
+
 #[derive(Debug, Clone)]
 pub struct StreamView {
     pub started_at: Option<String>,
@@ -139,6 +218,12 @@ pub enum Action {
     InstallUpdate,
     /// Close the launcher and start it again with SSLKEYLOGFILE in place.
     RestartLauncher(usize),
+    /// The risk-notice checkbox was toggled.
+    ConfirmDisclaimer(bool),
+    /// The risk notice was accepted and must not be shown again.
+    AcceptDisclaimer,
+    /// The risk notice was refused, so the application closes.
+    DeclineDisclaimer,
 }
 
 /// Installs the ARC Live look. Called once by the app and by the preview.
@@ -993,6 +1078,20 @@ fn settings_page(ui: &mut egui::Ui, model: &ViewModel<'_>, actions: &mut Vec<Act
                 RichText::new(format!("Движок захвата: {}", model.capture_backend))
                     .color(COLOR_MUTED),
             );
+        }
+    });
+
+    section(ui, "Ответственность");
+    card(ui, |ui| {
+        ui.label(
+            RichText::new("Независимый проект, не связанный с Embark Studios.")
+                .strong()
+                .color(COLOR_LOOT),
+        );
+        ui.add_space(6.0);
+        for paragraph in DISCLAIMER_PARAGRAPHS.iter().skip(1) {
+            ui.label(RichText::new(*paragraph).color(COLOR_MUTED));
+            ui.add_space(6.0);
         }
     });
 }

@@ -2,7 +2,7 @@ use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
 use arc_live_collector::{CollectorEvent, ProbePayload};
-use arc_live_core::config::AppConfig;
+use arc_live_core::config::{AppConfig, DISCLAIMER_REVISION};
 use arc_live_core::paths::AppPaths;
 use arc_live_core::state::{AppState, CollectorPhase, GameKeylogStatus, OverlayStats};
 use arc_live_core::widget_config::WidgetConfig;
@@ -45,6 +45,8 @@ pub struct ArcLiveApp {
     widget_config_error: Option<String>,
     launchers: Vec<(session_setup::Launcher, std::path::PathBuf)>,
     confirm_new_stream: bool,
+    /// The risk-notice checkbox; the decision itself lives in the config.
+    disclaimer_confirmed: bool,
     onboarding_step: usize,
     page: Page,
     theme_installed: bool,
@@ -140,6 +142,7 @@ impl ArcLiveApp {
             widget_config_error: None,
             launchers: session_setup::installed_launchers(),
             confirm_new_stream: false,
+            disclaimer_confirmed: false,
             onboarding_step: 0,
             page: Page::Stream,
             theme_installed: false,
@@ -864,6 +867,18 @@ impl ArcLiveApp {
                 Ok(()) => ctx.send_viewport_cmd(egui::ViewportCommand::Close),
                 Err(error) => self.updates.error = Some(format!("{error:#}")),
             },
+            Action::ConfirmDisclaimer(confirmed) => self.disclaimer_confirmed = confirmed,
+            Action::AcceptDisclaimer => {
+                self.config.disclaimer_accepted_revision = DISCLAIMER_REVISION;
+                if let Err(error) = self.config.save(&self.paths.config) {
+                    self.state
+                        .write()
+                        .expect("state poisoned")
+                        .record("error", format!("Saving the risk notice failed: {error:#}"));
+                }
+                self.record_user_event("info", "Предупреждение о рисках принято".to_owned());
+            }
+            Action::DeclineDisclaimer => ctx.send_viewport_cmd(egui::ViewportCommand::Close),
         }
     }
 
@@ -993,6 +1008,17 @@ impl eframe::App for ArcLiveApp {
             }
         }
         self.updates.drain();
+        // The risk notice comes before anything else, including onboarding, and
+        // returns after an update that raises the revision.
+        if self.config.disclaimer_accepted_revision < DISCLAIMER_REVISION {
+            self.drain_events();
+            let actions = view::disclaimer(root, self.disclaimer_confirmed);
+            for action in actions {
+                self.apply(action, root.ctx());
+            }
+            root.ctx().request_repaint_after(Duration::from_millis(250));
+            return;
+        }
         if !self.config.onboarding_completed {
             self.drain_events();
             self.onboarding_ui(root);
