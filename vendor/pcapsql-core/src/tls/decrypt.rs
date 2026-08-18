@@ -140,10 +140,15 @@ impl DecryptionContext {
         version: u16,
         ciphertext: &[u8],
     ) -> Result<Vec<u8>, DecryptionError> {
-        // TLS 1.2 AEAD record structure:
-        // explicit_nonce (8 bytes) || encrypted_data || auth_tag (16 bytes)
-        let explicit_nonce_len = 8;
         let tag_len = self.algorithm.tag_len();
+
+        // Two nonce constructions coexist in TLS 1.2 AEAD:
+        // - GCM (RFC 5288): explicit_nonce (8 bytes) || encrypted_data || tag,
+        //   nonce = implicit_iv(4) || explicit_nonce(8).
+        // - ChaCha20-Poly1305 (RFC 7905): encrypted_data || tag, no explicit
+        //   nonce, nonce = write_iv(12) XOR left-padded sequence number.
+        let is_chacha = matches!(self.algorithm, AeadAlgorithm::Chacha20Poly1305);
+        let explicit_nonce_len = if is_chacha { 0 } else { 8 };
         let min_len = explicit_nonce_len + tag_len;
 
         if ciphertext.len() < min_len {
@@ -153,13 +158,21 @@ impl DecryptionContext {
             });
         }
 
-        let explicit_nonce = &ciphertext[..explicit_nonce_len];
         let encrypted_with_tag = &ciphertext[explicit_nonce_len..];
 
-        // Construct the 12-byte nonce: implicit_iv (4) || explicit_nonce (8)
+        // Construct the 12-byte nonce.
         let mut nonce_bytes = [0u8; 12];
-        nonce_bytes[..4].copy_from_slice(&self.iv[..4.min(self.iv.len())]);
-        nonce_bytes[4..].copy_from_slice(explicit_nonce);
+        if is_chacha {
+            nonce_bytes.copy_from_slice(&self.iv[..12.min(self.iv.len())]);
+            let seq_bytes = self.sequence_number.to_be_bytes();
+            for i in 0..8 {
+                nonce_bytes[4 + i] ^= seq_bytes[i];
+            }
+        } else {
+            let explicit_nonce = &ciphertext[..explicit_nonce_len];
+            nonce_bytes[..4].copy_from_slice(&self.iv[..4.min(self.iv.len())]);
+            nonce_bytes[4..].copy_from_slice(explicit_nonce);
+        }
 
         let nonce = Nonce::try_assume_unique_for_key(&nonce_bytes)
             .map_err(|_| DecryptionError::InvalidNonceLength(nonce_bytes.len()))?;
@@ -479,4 +492,73 @@ mod tests {
 
     // Note: We can't easily test successful decryption without a known test vector
     // or generating actual encrypted data. Integration tests will cover this.
+
+    /// Build the TLS 1.2 AAD the decrypt path expects for a given record.
+    fn tls12_aad(seq: u64, record_type: u8, version: u16, plaintext_len: usize) -> [u8; 13] {
+        let mut aad = [0u8; 13];
+        aad[..8].copy_from_slice(&seq.to_be_bytes());
+        aad[8] = record_type;
+        aad[9..11].copy_from_slice(&version.to_be_bytes());
+        aad[11..13].copy_from_slice(&(plaintext_len as u16).to_be_bytes());
+        aad
+    }
+
+    #[test]
+    fn tls12_chacha_round_trip_uses_implicit_nonce() {
+        // RFC 7905: no explicit nonce on the wire, 12-byte implicit IV XOR seq.
+        let key_bytes = [0x24u8; 32];
+        let iv = [0x9bu8; 12];
+        let plaintext = b"stats body over TLS 1.2 ChaCha20";
+        let (record_type, version) = (23u8, 0x0303u16);
+
+        // Encrypt exactly as a TLS 1.2 ChaCha20 sender would: nonce = iv XOR seq0.
+        let nonce = Nonce::assume_unique_for_key(iv);
+        let aad = tls12_aad(0, record_type, version, plaintext.len());
+        let sealing =
+            LessSafeKey::new(UnboundKey::new(&CHACHA20_POLY1305, &key_bytes).unwrap());
+        let mut sealed = plaintext.to_vec();
+        sealing
+            .seal_in_place_append_tag(nonce, Aad::from(&aad), &mut sealed)
+            .unwrap();
+
+        // No explicit nonce is prepended for ChaCha.
+        let mut ctx =
+            DecryptionContext::new(AeadAlgorithm::Chacha20Poly1305, &key_bytes, &iv).unwrap();
+        let decrypted = ctx
+            .decrypt_tls12_record(record_type, version, &sealed)
+            .expect("TLS 1.2 ChaCha record must decrypt");
+        assert_eq!(decrypted, plaintext);
+        assert_eq!(ctx.sequence_number(), 1);
+    }
+
+    #[test]
+    fn tls12_gcm_round_trip_consumes_explicit_nonce() {
+        let key_bytes = [0x31u8; 16];
+        let iv = [0x0au8; 4];
+        let explicit_nonce = [0x77u8; 8];
+        let plaintext = b"stats body over TLS 1.2 GCM";
+        let (record_type, version) = (23u8, 0x0303u16);
+
+        let mut nonce_bytes = [0u8; 12];
+        nonce_bytes[..4].copy_from_slice(&iv);
+        nonce_bytes[4..].copy_from_slice(&explicit_nonce);
+        let nonce = Nonce::assume_unique_for_key(nonce_bytes);
+        let aad = tls12_aad(0, record_type, version, plaintext.len());
+        let sealing = LessSafeKey::new(UnboundKey::new(&AES_128_GCM, &key_bytes).unwrap());
+        let mut sealed = plaintext.to_vec();
+        sealing
+            .seal_in_place_append_tag(nonce, Aad::from(&aad), &mut sealed)
+            .unwrap();
+
+        // On the wire the explicit nonce precedes the ciphertext.
+        let mut wire = explicit_nonce.to_vec();
+        wire.extend_from_slice(&sealed);
+
+        let mut ctx = DecryptionContext::new(AeadAlgorithm::Aes128Gcm, &key_bytes, &iv).unwrap();
+        let decrypted = ctx
+            .decrypt_tls12_record(record_type, version, &wire)
+            .expect("TLS 1.2 GCM record must decrypt");
+        assert_eq!(decrypted, plaintext);
+        assert_eq!(ctx.sequence_number(), 1);
+    }
 }

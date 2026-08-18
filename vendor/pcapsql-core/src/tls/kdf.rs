@@ -254,7 +254,13 @@ pub fn derive_tls12_keys(
     // For AEAD ciphers, MAC key length is 0
     let mac_key_len = 0;
     let enc_key_len = aead.key_len();
-    let iv_len = 4; // Fixed IV length for TLS 1.2 AEAD
+    // GCM (RFC 5288) uses a 4-byte implicit IV plus an 8-byte explicit nonce on
+    // the wire. ChaCha20-Poly1305 (RFC 7905) has no explicit nonce: the whole
+    // 12-byte IV is derived here and XORed with the sequence number at decrypt.
+    let iv_len = match aead {
+        AeadAlgorithm::Chacha20Poly1305 => 12,
+        _ => 4,
+    };
 
     // Total key material needed
     let key_block_len = 2 * mac_key_len + 2 * enc_key_len + 2 * iv_len;
@@ -400,6 +406,29 @@ pub fn derive_tls13_keys(
     let iv = hkdf_expand_label(&prk, b"iv", &[], iv_len)?;
 
     Ok(Tls13KeyMaterial { key, iv })
+}
+
+/// Ratchet a TLS 1.3 application traffic secret after a KeyUpdate.
+///
+/// RFC 8446 §7.2:
+///   application_traffic_secret_N+1 =
+///       HKDF-Expand-Label(application_traffic_secret_N, "traffic upd", "", Hash.length)
+///
+/// The sender that emits a KeyUpdate advances its own write secret and resets
+/// its record sequence number to zero; the peer must recompute the same secret
+/// to keep decrypting that direction. Passive capture holds the current secret,
+/// so this needs no new key-log material.
+pub fn derive_tls13_next_secret(
+    traffic_secret: &[u8],
+    cipher_suite_id: u16,
+) -> Result<Vec<u8>, KeyDerivationError> {
+    let hash_algo = hash_for_cipher_suite(cipher_suite_id)
+        .ok_or(KeyDerivationError::UnsupportedCipherSuite(cipher_suite_id))?;
+
+    let hkdf_algo = hash_algo.hkdf_algorithm();
+    let prk = Prk::new_less_safe(hkdf_algo, traffic_secret);
+
+    hkdf_expand_label(&prk, b"traffic upd", &[], hash_algo.output_len())
 }
 
 #[cfg(test)]
@@ -595,6 +624,38 @@ mod tests {
 
         assert_ne!(keys1.key, keys3.key);
         assert_ne!(keys1.iv, keys3.iv);
+    }
+
+    #[test]
+    fn test_tls12_chacha_derives_full_iv() {
+        let master_secret = [0x42u8; 48];
+        let client_random = [0x01u8; 32];
+        let server_random = [0x02u8; 32];
+
+        // TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256 needs a 12-byte implicit IV.
+        let keys = derive_tls12_keys(&master_secret, &client_random, &server_random, 0xCCA8)
+            .expect("key derivation should succeed");
+        assert_eq!(keys.client_write_key.len(), 32);
+        assert_eq!(keys.client_write_iv.len(), 12);
+        assert_eq!(keys.server_write_iv.len(), 12);
+
+        // GCM still uses the 4-byte implicit IV.
+        let gcm = derive_tls12_keys(&master_secret, &client_random, &server_random, 0xC02F).unwrap();
+        assert_eq!(gcm.client_write_iv.len(), 4);
+    }
+
+    #[test]
+    fn test_derive_tls13_next_secret() {
+        let secret = [0x42u8; 32];
+        let next = derive_tls13_next_secret(&secret, 0x1301).expect("ratchet should succeed");
+        assert_eq!(next.len(), 32);
+        // The ratcheted secret differs from the input and is deterministic.
+        assert_ne!(next.as_slice(), &secret[..]);
+        let again = derive_tls13_next_secret(&secret, 0x1301).unwrap();
+        assert_eq!(next, again);
+        // SHA-384 suites ratchet to a 48-byte secret.
+        let long = derive_tls13_next_secret(&[0x42u8; 48], 0x1302).unwrap();
+        assert_eq!(long.len(), 48);
     }
 
     #[test]

@@ -2,6 +2,20 @@
 
 All notable changes to ARC Live are documented here.
 
+## 0.21.0 - 2026-08-18
+
+- Recovered a stream after a dropped packet by skipping the gap once it was clearly lost, instead of stalling the whole raid.
+- Followed a TLS 1.3 KeyUpdate so a long connection keeps decrypting instead of going silent after the server rotates its key.
+- Fixed TLS 1.2 so it decrypts at all, including the ChaCha20 cipher, for players downgraded by antivirus TLS inspection.
+- Recovered a session whose handshake keys had aged out of the key-log window instead of leaving it permanently undecryptable.
+- Filtered the Windows packet capture to the game's port and counted the packets it drops under load.
+- Bound the raw-socket capture to every adapter and rebound it when a VPN or virtual adapter appears mid-session.
+- Warned when packets flow but none of the game's traffic is seen, and when the game was started before ARC Live so its keys cannot be captured.
+- Never dropped the statistics response even when a backlog of routine updates filled the channel.
+- Ignored a statistics answer with an empty scope instead of zeroing the widget with it.
+- Pushed the reset counters to OBS immediately at a midnight rollover.
+- Stopped falsely reporting the key log as missing for the 32-bit Epic launcher.
+
 ## 0.20.0 - 2026-08-18
 
 - Read statistics responses larger than the scan buffer, which silently stopped capture for accounts with a long history.

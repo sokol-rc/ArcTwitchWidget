@@ -37,6 +37,10 @@ pub struct StreamBuffer {
     pub segment_count: u32,
     pub retransmit_count: u32,
     pub out_of_order_count: u32,
+    /// Sequence bytes skipped past an unfillable gap.
+    pub bytes_skipped: u64,
+    /// How many maintenance ticks the stream has been stuck behind a gap.
+    stuck_ticks: u8,
     /// FIN received.
     pub fin_received: bool,
 }
@@ -53,6 +57,8 @@ impl StreamBuffer {
             segment_count: 0,
             retransmit_count: 0,
             out_of_order_count: 0,
+            bytes_skipped: 0,
+            stuck_ticks: 0,
             fin_received: false,
         }
     }
@@ -85,6 +91,7 @@ impl StreamBuffer {
             self.segment_count += 1;
             self.reassembled.extend_from_slice(data);
             self.expected_seq = seq_add(seq, data.len());
+            self.stuck_ticks = 0;
             true
         } else {
             false
@@ -156,12 +163,14 @@ impl StreamBuffer {
         if segment.seq == self.expected_seq {
             self.reassembled.extend_from_slice(&segment.data);
             self.expected_seq = seq_add(segment.seq, segment.data.len());
+            self.stuck_ticks = 0;
 
             // Check if pending segments can now be added
             self.flush_pending();
         } else if seq_lt(self.expected_seq, segment.seq) {
-            // Out of order - buffer it
+            // Out of order - buffer it behind a gap.
             self.out_of_order_count += 1;
+            self.note_gap(self.expected_seq, segment.seq);
             self.pending.insert(segment.seq, segment);
         }
     }
@@ -173,6 +182,7 @@ impl StreamBuffer {
                 let segment = self.pending.remove(&seq).unwrap();
                 self.reassembled.extend_from_slice(&segment.data);
                 self.expected_seq = seq_add(segment.seq, segment.data.len());
+                self.stuck_ticks = 0;
             } else if seq_lt(seq, self.expected_seq) {
                 // Retransmit that arrived late, remove it
                 self.pending.remove(&seq);
@@ -181,6 +191,54 @@ impl StreamBuffer {
                 break;
             }
         }
+    }
+
+    /// Record a gap once, without spamming an entry per late segment.
+    fn note_gap(&mut self, start: u32, end: u32) {
+        if self.gaps.last().map(|g| g.start_seq) != Some(start) {
+            self.record_gap(start, end);
+        }
+    }
+
+    /// Whether the stream is blocked: everything contiguous has been consumed
+    /// yet pending data waits behind a hole that has not been filled.
+    fn is_stuck(&self) -> bool {
+        self.reassembled.is_empty()
+            && self
+                .pending
+                .first_key_value()
+                .is_some_and(|(&seq, _)| seq_lt(self.expected_seq, seq))
+    }
+
+    /// Count one maintenance tick and report whether the stream has now been
+    /// stuck behind the same gap long enough to give up on the missing bytes.
+    /// Passive capture (`SNIFF | RECV_ONLY`) never sees a retransmit of a packet
+    /// it dropped, so a genuine hole would otherwise stall the stream forever.
+    pub fn tick_stuck(&mut self, threshold: u8) -> bool {
+        if self.is_stuck() {
+            self.stuck_ticks = self.stuck_ticks.saturating_add(1);
+            self.stuck_ticks >= threshold
+        } else {
+            self.stuck_ticks = 0;
+            false
+        }
+    }
+
+    /// Skip forward past an unfillable gap to the next buffered segment so the
+    /// stream can make progress again. Returns the number of sequence bytes
+    /// skipped, or `None` when the stream is not actually stuck.
+    pub fn recover_stuck_gap(&mut self) -> Option<u64> {
+        if !self.is_stuck() {
+            return None;
+        }
+        let target = *self.pending.first_key_value()?.0;
+        let skipped = u64::from(target.wrapping_sub(self.expected_seq));
+        self.note_gap(self.expected_seq, target);
+        self.expected_seq = target;
+        self.bytes_skipped = self.bytes_skipped.saturating_add(skipped);
+        self.stuck_ticks = 0;
+        self.flush_pending();
+        Some(skipped)
     }
 
     /// Get contiguous reassembled data.
@@ -312,6 +370,22 @@ impl TcpReassembler {
         }
     }
 
+    /// Advance every stuck stream that has stayed blocked behind a gap for at
+    /// least `threshold` maintenance ticks, skipping past the missing bytes.
+    /// Returns one entry per recovered stream: `(connection_id, direction,
+    /// bytes_skipped)`, so the caller can report a possibly-missed message.
+    pub fn recover_stuck_gaps(&mut self, threshold: u8) -> Vec<(u64, Direction, u64)> {
+        let mut recovered = Vec::new();
+        for (key, buffer) in self.streams.iter_mut() {
+            if buffer.tick_stuck(threshold) {
+                if let Some(skipped) = buffer.recover_stuck_gap() {
+                    recovered.push((key.connection_id, key.direction, skipped));
+                }
+            }
+        }
+        recovered
+    }
+
     /// Get contiguous data for a stream.
     pub fn get_contiguous(&self, connection_id: u64, direction: Direction) -> &[u8] {
         let key = StreamKey {
@@ -393,6 +467,7 @@ impl TcpReassembler {
             retransmit_count: b.retransmit_count,
             out_of_order_count: b.out_of_order_count,
             gap_count: b.gaps.len() as u32,
+            bytes_skipped: b.bytes_skipped,
             bytes_available: b.available(),
         })
     }
@@ -411,6 +486,7 @@ pub struct StreamStats {
     pub retransmit_count: u32,
     pub out_of_order_count: u32,
     pub gap_count: u32,
+    pub bytes_skipped: u64,
     pub bytes_available: usize,
 }
 
@@ -662,6 +738,51 @@ mod tests {
         // Now even if we have in-order data, fast path should return false
         // because there are pending segments
         assert!(!buffer.add_inorder_data(1005, b"_____", 2, 1));
+    }
+
+    // Test 15: A stuck gap is skipped only after the tick threshold, and the
+    // stream then makes progress past the missing bytes.
+    #[test]
+    fn recovers_a_stream_stuck_behind_an_unfillable_gap() {
+        let mut reassembler = TcpReassembler::new();
+        reassembler.add_segment(1, Direction::ToClient, 1000, b"HEAD", 1, 0);
+        // 1004..1010 is lost; the tail arrives out of order and waits.
+        reassembler.add_segment(1, Direction::ToClient, 1010, b"TAIL", 2, 1);
+        // Consume the contiguous head so the stream is now blocked on the hole.
+        reassembler.consume(1, Direction::ToClient, 4);
+        assert_eq!(reassembler.get_contiguous(1, Direction::ToClient), b"");
+
+        // One tick is not enough - a merely reordered segment must get a chance.
+        assert!(reassembler.recover_stuck_gaps(2).is_empty());
+        assert_eq!(reassembler.get_contiguous(1, Direction::ToClient), b"");
+
+        // On the second tick it gives up and skips to the buffered tail.
+        let recovered = reassembler.recover_stuck_gaps(2);
+        assert_eq!(recovered, vec![(1, Direction::ToClient, 6)]);
+        assert_eq!(reassembler.get_contiguous(1, Direction::ToClient), b"TAIL");
+
+        let stats = reassembler.stats(1, Direction::ToClient).unwrap();
+        assert_eq!(stats.bytes_skipped, 6);
+        assert!(stats.gap_count >= 1);
+    }
+
+    // Test 16: A gap that fills before the threshold is never skipped.
+    #[test]
+    fn a_reordered_segment_is_not_skipped() {
+        let mut reassembler = TcpReassembler::new();
+        reassembler.add_segment(1, Direction::ToClient, 1000, b"HEAD", 1, 0);
+        reassembler.add_segment(1, Direction::ToClient, 1008, b"TAIL", 2, 1);
+        reassembler.consume(1, Direction::ToClient, 4);
+
+        // First tick observes the gap but waits.
+        assert!(reassembler.recover_stuck_gaps(2).is_empty());
+        // The missing middle finally arrives and the stream is whole again.
+        reassembler.add_segment(1, Direction::ToClient, 1004, b"MIDD", 3, 2);
+        assert_eq!(reassembler.get_contiguous(1, Direction::ToClient), b"MIDDTAIL");
+        // The stuck counter was reset, so nothing is ever skipped.
+        assert!(reassembler.recover_stuck_gaps(2).is_empty());
+        let stats = reassembler.stats(1, Direction::ToClient).unwrap();
+        assert_eq!(stats.bytes_skipped, 0);
     }
 
     #[test]

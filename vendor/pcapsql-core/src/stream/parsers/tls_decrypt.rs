@@ -42,8 +42,10 @@ struct ConnectionTlsState {
     session: TlsSession,
     /// Whether handshake is complete
     handshake_complete: bool,
-    /// Track if we've seen ChangeCipherSpec (TLS 1.2)
-    change_cipher_spec_seen: bool,
+    /// Whether the client sent its ChangeCipherSpec (TLS 1.2, to-server).
+    ccs_seen_to_server: bool,
+    /// Whether the server sent its ChangeCipherSpec (TLS 1.2, to-client).
+    ccs_seen_to_client: bool,
 }
 
 impl ConnectionTlsState {
@@ -51,7 +53,17 @@ impl ConnectionTlsState {
         Self {
             session: TlsSession::new(keylog),
             handshake_complete: false,
-            change_cipher_spec_seen: false,
+            ccs_seen_to_server: false,
+            ccs_seen_to_client: false,
+        }
+    }
+
+    /// Whether ChangeCipherSpec has been seen for the given direction, i.e. any
+    /// further handshake-typed record in that direction is encrypted.
+    fn ccs_seen(&self, direction: Direction) -> bool {
+        match direction {
+            Direction::ToServer => self.ccs_seen_to_server,
+            Direction::ToClient => self.ccs_seen_to_client,
         }
     }
 }
@@ -315,6 +327,49 @@ impl DecryptingTlsStreamParser {
             fields.insert("encrypted_hs_messages", FieldValue::UInt64(message_count));
         }
     }
+
+    /// Handle TLS 1.3 post-handshake messages that arrive in application-data
+    /// mode. The only one that affects decryption is KeyUpdate (type 24): the
+    /// sender has ratcheted its own write secret and reset its record sequence
+    /// number, so this direction's key must be re-derived or every following
+    /// record fails authentication forever.
+    fn process_post_handshake(
+        state: &mut ConnectionTlsState,
+        handshake_data: &[u8],
+        direction: TlsDirection,
+        fields: &mut HashMap<&'static str, OwnedFieldValue>,
+    ) {
+        let mut offset = 0usize;
+        while offset + 4 <= handshake_data.len() {
+            let hs_type = handshake_data[offset];
+            let hs_len = u32::from_be_bytes([
+                0,
+                handshake_data[offset + 1],
+                handshake_data[offset + 2],
+                handshake_data[offset + 3],
+            ]) as usize;
+            let next = offset + 4 + hs_len;
+            if next > handshake_data.len() {
+                break;
+            }
+
+            if hs_type == 24 {
+                match state.session.apply_key_update(direction) {
+                    Ok(()) => {
+                        fields.insert("key_update", FieldValue::Bool(true));
+                    }
+                    Err(error) => {
+                        fields.insert(
+                            "key_update_error",
+                            FieldValue::OwnedString(CompactString::new(error.to_string())),
+                        );
+                    }
+                }
+            }
+
+            offset = next;
+        }
+    }
 }
 
 /// Detect TLS 1.3 from ServerHello extensions.
@@ -404,8 +459,19 @@ impl StreamParser for DecryptingTlsStreamParser {
                     // Handshake
                     fields.insert("record_type", FieldValue::Str("Handshake"));
 
-                    // Parse handshake using tls-parser
-                    if let Ok((_, record)) = parse_tls_plaintext(&record_data) {
+                    if state.session.handshake().effective_version() == Some(TlsVersion::Tls12)
+                        && state.ccs_seen(context.direction)
+                    {
+                        // An encrypted TLS 1.2 handshake record (the Finished, or
+                        // a post-handshake message). It cannot be parsed as
+                        // plaintext and it consumes one AEAD sequence number in
+                        // this direction; account for it so the first application
+                        // record decrypts at the correct sequence number.
+                        let tls_dir = Self::to_tls_direction(context.direction);
+                        state.session.advance_tls12_sequence(tls_dir);
+                        fields.insert("encrypted_handshake", FieldValue::Bool(true));
+                    } else if let Ok((_, record)) = parse_tls_plaintext(&record_data) {
+                        // Parse handshake using tls-parser
                         for msg in &record.msg {
                             if let TlsMessage::Handshake(hs) = msg {
                                 Self::process_handshake(state, hs, context.direction, &mut fields);
@@ -502,9 +568,16 @@ impl StreamParser for DecryptingTlsStreamParser {
                                             if inner_type == 23 {
                                                 decrypted_data.extend_from_slice(inner_data);
                                             }
-                                            // Handle post-handshake messages (NewSessionTicket, etc.)
+                                            // Handle post-handshake messages (NewSessionTicket, KeyUpdate, ...).
                                             else if inner_type == 22 {
-                                                // Post-handshake control message.
+                                                let tls_dir =
+                                                    Self::to_tls_direction(context.direction);
+                                                Self::process_post_handshake(
+                                                    state,
+                                                    inner_data,
+                                                    tls_dir,
+                                                    &mut fields,
+                                                );
                                             } else {
                                                 // Some producers/proxies appear to yield
                                                 // authenticated plaintext without a TLS 1.3
@@ -540,7 +613,10 @@ impl StreamParser for DecryptingTlsStreamParser {
                 20 => {
                     // ChangeCipherSpec
                     fields.insert("record_type", FieldValue::Str("ChangeCipherSpec"));
-                    state.change_cipher_spec_seen = true;
+                    match context.direction {
+                        Direction::ToServer => state.ccs_seen_to_server = true,
+                        Direction::ToClient => state.ccs_seen_to_client = true,
+                    }
                 }
 
                 21 => {
@@ -583,18 +659,15 @@ impl StreamParser for DecryptingTlsStreamParser {
             // Guess child protocol based on ALPN or default to http2
             let child_protocol = "http2"; // TODO: detect from ALPN
 
-            // Return first TLS message as metadata, transform for child parsing
-            let metadata = if !messages.is_empty() {
-                Some(messages.remove(0))
-            } else {
-                None
-            };
-
+            // Forward every per-record TLS message as metadata, not just the
+            // first: they carry the per-record decrypt/telemetry fields, and
+            // dropping the rest under-counted decrypt errors that are the only
+            // way a silent decryption fault shows up in diagnostics.
             StreamParseResult::Transform {
                 child_protocol,
                 child_data: decrypted_data,
                 bytes_consumed: total_consumed,
-                metadata,
+                metadata: messages,
             }
         } else if !messages.is_empty() {
             // Have TLS messages but no decrypted data
@@ -633,6 +706,9 @@ impl StreamParser for DecryptingTlsStreamParser {
             FieldDescriptor::new("session_state", DataKind::String).set_nullable(true),
             FieldDescriptor::new("encrypted_hs_type", DataKind::String).set_nullable(true),
             FieldDescriptor::new("encrypted_hs_messages", DataKind::UInt64).set_nullable(true),
+            FieldDescriptor::new("encrypted_handshake", DataKind::Bool).set_nullable(true),
+            FieldDescriptor::new("key_update", DataKind::Bool).set_nullable(true),
+            FieldDescriptor::new("key_update_error", DataKind::String).set_nullable(true),
             FieldDescriptor::new("hs_finished", DataKind::String).set_nullable(true),
             FieldDescriptor::new("inner_content_type", DataKind::UInt8).set_nullable(true),
             FieldDescriptor::new("decrypted_length", DataKind::UInt64).set_nullable(true),

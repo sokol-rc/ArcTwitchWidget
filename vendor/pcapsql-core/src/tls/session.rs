@@ -6,7 +6,10 @@
 use std::sync::Arc;
 
 use super::decrypt::{DecryptionContext, DecryptionError, Direction, TlsVersion};
-use super::kdf::{derive_tls12_keys, derive_tls13_keys, AeadAlgorithm, KeyDerivationError};
+use super::kdf::{
+    derive_tls12_keys, derive_tls13_keys, derive_tls13_next_secret, AeadAlgorithm,
+    KeyDerivationError,
+};
 use super::keylog::{KeyLog, KeyLogEntries};
 use thiserror::Error;
 
@@ -129,6 +132,14 @@ pub struct TlsSession {
 
     /// TLS 1.3 handshake phase tracking
     tls13_hs_phase: Tls13HandshakePhase,
+
+    /// TLS 1.3 only: current client application traffic secret, ratcheted on a
+    /// client KeyUpdate to re-derive the client-to-server key.
+    client_traffic_secret: Option<Vec<u8>>,
+
+    /// TLS 1.3 only: current server application traffic secret, ratcheted on a
+    /// server KeyUpdate to re-derive the server-to-client key.
+    server_traffic_secret: Option<Vec<u8>>,
 }
 
 impl TlsSession {
@@ -143,6 +154,8 @@ impl TlsSession {
             client_hs_decrypt: None,
             server_hs_decrypt: None,
             tls13_hs_phase: Tls13HandshakePhase::Initial,
+            client_traffic_secret: None,
+            server_traffic_secret: None,
         }
     }
 
@@ -199,9 +212,12 @@ impl TlsSession {
     /// - Cipher suite selection
     /// - Key material from SSLKEYLOGFILE
     pub fn try_establish_keys(&mut self) -> Result<(), SessionError> {
-        if self.state == SessionState::KeysEstablished
-            || self.state == SessionState::Tls13HandshakeEncrypted
-        {
+        // Only stop once we can actually decrypt. Returning early merely because
+        // the state was set to `Tls13HandshakeEncrypted` stranded a session for
+        // good when its handshake secrets had scrolled out of the key-log window
+        // before the application secrets arrived: `update_keylog` could never
+        // retry, and every application record then failed silently.
+        if self.can_decrypt() {
             return Ok(()); // Already done
         }
 
@@ -237,8 +253,18 @@ impl TlsSession {
         match version {
             TlsVersion::Tls13 => {
                 self.establish_tls13_keys(&key_entries, cipher_suite, aead)?;
-                // For TLS 1.3, we start in handshake encryption mode
-                self.state = SessionState::Tls13HandshakeEncrypted;
+                // Normally TLS 1.3 starts in handshake-encryption mode. But if
+                // only the application secrets were available (the handshake
+                // secrets aged out of the key-log window), skip straight to
+                // application mode: the encrypted Finished can no longer be
+                // followed, yet application data - which carries the stats -
+                // decrypts directly, so the session must not stay stranded.
+                self.state = if self.client_hs_decrypt.is_some() && self.server_hs_decrypt.is_some()
+                {
+                    SessionState::Tls13HandshakeEncrypted
+                } else {
+                    SessionState::KeysEstablished
+                };
             }
             _ => {
                 self.establish_tls12_keys(
@@ -322,10 +348,61 @@ impl TlsSession {
         self.client_decrypt = Some(DecryptionContext::new_tls13(&client_keys, aead)?);
         self.server_decrypt = Some(DecryptionContext::new_tls13(&server_keys, aead)?);
 
+        // Keep the raw secrets so a later KeyUpdate can ratchet them forward.
+        self.client_traffic_secret = Some(client_secret.clone());
+        self.server_traffic_secret = Some(server_secret.clone());
+
         // Reset handshake phase tracking
         self.tls13_hs_phase = Tls13HandshakePhase::Initial;
 
         Ok(())
+    }
+
+    /// Apply a TLS 1.3 KeyUpdate for one direction.
+    ///
+    /// The peer that sent the KeyUpdate has ratcheted its own write secret and
+    /// reset its record sequence number to zero. Re-derive that direction's key
+    /// and IV from the next traffic secret and install a fresh context (whose
+    /// sequence number starts at zero) so subsequent records keep decrypting.
+    pub fn apply_key_update(&mut self, direction: Direction) -> Result<(), SessionError> {
+        let cipher_suite = self
+            .handshake
+            .cipher_suite
+            .ok_or(SessionError::MissingCipherSuite)?;
+        let aead = AeadAlgorithm::from_cipher_suite(cipher_suite)
+            .ok_or(SessionError::UnsupportedCipherSuite(cipher_suite))?;
+
+        let secret_slot = match direction {
+            Direction::ClientToServer => &mut self.client_traffic_secret,
+            Direction::ServerToClient => &mut self.server_traffic_secret,
+        };
+        let current = secret_slot.as_ref().ok_or(SessionError::MissingKeys)?;
+        let next = derive_tls13_next_secret(current, cipher_suite)?;
+        let keys = derive_tls13_keys(&next, cipher_suite)?;
+        let context = DecryptionContext::new_tls13(&keys, aead)?;
+
+        match direction {
+            Direction::ClientToServer => self.client_decrypt = Some(context),
+            Direction::ServerToClient => self.server_decrypt = Some(context),
+        }
+        *secret_slot = Some(next);
+        Ok(())
+    }
+
+    /// Account for one encrypted TLS 1.2 record that is not application data
+    /// (the encrypted Finished, or a post-handshake message) by advancing the
+    /// direction's sequence number without decrypting it. Without this the very
+    /// first application record is decrypted with the wrong sequence number and
+    /// every later record stays off by one, so TLS 1.2 never decrypts at all.
+    pub fn advance_tls12_sequence(&mut self, direction: Direction) {
+        let context = match direction {
+            Direction::ClientToServer => self.client_decrypt.as_mut(),
+            Direction::ServerToClient => self.server_decrypt.as_mut(),
+        };
+        if let Some(context) = context {
+            let next = context.sequence_number().saturating_add(1);
+            context.set_sequence_number(next);
+        }
     }
 
     /// Check if the session can decrypt traffic.
@@ -694,6 +771,124 @@ SERVER_TRAFFIC_SECRET_0 0123456789abcdef0123456789abcdef0123456789abcdef01234567
 
         data.cipher_suite = Some(0xC02F);
         assert!(data.can_derive_keys());
+    }
+
+    /// The client_random the TLS 1.3 test key-logs are keyed on.
+    const TLS13_CLIENT_RANDOM: [u8; 32] = [
+        0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef, 0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd,
+        0xef, 0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef, 0x01, 0x23, 0x45, 0x67, 0x89, 0xab,
+        0xcd, 0xef,
+    ];
+
+    fn hex_to_bytes(hex: &str) -> Vec<u8> {
+        (0..hex.len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(&hex[i..i + 2], 16).unwrap())
+            .collect()
+    }
+
+    /// A TLS 1.3 key-log with the application secrets only - the shape left
+    /// behind when the earlier handshake secrets have scrolled out of the
+    /// 4 MiB key-log window before the application secrets were written.
+    fn app_only_tls13_keylog() -> Arc<KeyLog> {
+        let content = "\
+CLIENT_TRAFFIC_SECRET_0 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef aabbccdd00112233445566778899aabbccddeeff00112233445566778899aabb
+SERVER_TRAFFIC_SECRET_0 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef 11223344556677889900aabbccddeeff00112233445566778899aabbccddeeff
+";
+        Arc::new(KeyLog::parse(content).unwrap())
+    }
+
+    #[test]
+    fn tls13_with_only_application_secrets_reaches_app_mode() {
+        let mut session = TlsSession::new(app_only_tls13_keylog());
+        session.process_client_hello(TLS13_CLIENT_RANDOM);
+        session
+            .process_server_hello([0x43; 32], 0x1301, TlsVersion::Tls13)
+            .unwrap();
+
+        // No handshake secrets, so the encrypted Finished cannot be followed,
+        // but application data decrypts directly - the session must not strand.
+        assert_eq!(session.state(), SessionState::KeysEstablished);
+        assert!(session.can_decrypt());
+        assert!(!session.is_tls13_handshake_phase());
+    }
+
+    #[test]
+    fn tls13_app_only_secrets_recover_on_live_update() {
+        let mut session = TlsSession::new(Arc::new(KeyLog::new()));
+        session.process_client_hello(TLS13_CLIENT_RANDOM);
+        assert!(matches!(
+            session.process_server_hello([0x43; 32], 0x1301, TlsVersion::Tls13),
+            Err(SessionError::MissingKeys)
+        ));
+        assert!(!session.can_decrypt());
+
+        // The application secrets arrive later; the retry must not be blocked by
+        // an early return that only checked the session state.
+        session.update_keylog(app_only_tls13_keylog()).unwrap();
+        assert!(session.can_decrypt());
+        assert_eq!(session.state(), SessionState::KeysEstablished);
+    }
+
+    #[test]
+    fn key_update_ratchets_the_direction_key() {
+        use ring::aead::{Aad, LessSafeKey, Nonce, UnboundKey, AES_128_GCM};
+
+        let mut session = TlsSession::new(create_test_keylog_tls13());
+        session.process_client_hello(TLS13_CLIENT_RANDOM);
+        session
+            .process_server_hello([0x43; 32], 0x1301, TlsVersion::Tls13)
+            .unwrap();
+        session.mark_server_finished();
+        session.mark_client_finished();
+        assert_eq!(session.state(), SessionState::KeysEstablished);
+
+        // Independently compute the key the server would use after one KeyUpdate,
+        // seal a record with it, and confirm the session decrypts it only once
+        // the ratchet has been applied.
+        let server_secret =
+            hex_to_bytes("11223344556677889900aabbccddeeff00112233445566778899aabbccddeeff");
+        let next = super::derive_tls13_next_secret(&server_secret, 0x1301).unwrap();
+        let material = super::derive_tls13_keys(&next, 0x1301).unwrap();
+
+        let plaintext = b"post-KeyUpdate stats record";
+        let mut sealed = plaintext.to_vec();
+        let total_len = plaintext.len() + 16;
+        let header = [
+            23u8,
+            0x03,
+            0x03,
+            (total_len >> 8) as u8,
+            total_len as u8,
+        ];
+        let mut nonce_bytes = [0u8; 12];
+        nonce_bytes.copy_from_slice(&material.iv[..12]);
+        let nonce = Nonce::assume_unique_for_key(nonce_bytes);
+        let sealing = LessSafeKey::new(UnboundKey::new(&AES_128_GCM, &material.key).unwrap());
+        sealing
+            .seal_in_place_append_tag(nonce, Aad::from(&header), &mut sealed)
+            .unwrap();
+
+        session.apply_key_update(Direction::ServerToClient).unwrap();
+        assert_eq!(session.server_sequence(), Some(0));
+        let decrypted = session
+            .decrypt_application_record(Direction::ServerToClient, 23, &sealed)
+            .expect("record sealed with the ratcheted key must decrypt");
+        assert_eq!(decrypted, plaintext);
+    }
+
+    #[test]
+    fn advance_tls12_sequence_accounts_for_the_encrypted_finished() {
+        let mut session = TlsSession::new(create_test_keylog());
+        session.process_client_hello(TLS13_CLIENT_RANDOM);
+        session
+            .process_server_hello([0x43; 32], 0xC02F, TlsVersion::Tls12)
+            .unwrap();
+        assert_eq!(session.client_sequence(), Some(0));
+        session.advance_tls12_sequence(Direction::ClientToServer);
+        assert_eq!(session.client_sequence(), Some(1));
+        // The other direction is untouched.
+        assert_eq!(session.server_sequence(), Some(0));
     }
 
     #[test]

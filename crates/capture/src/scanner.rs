@@ -90,6 +90,10 @@ pub struct CaptureStats {
     pub capture_backend: String,
     /// Segments Winsock delivered truncated and we had to drop.
     pub oversized_packets: u64,
+    /// Times a stream was unstuck by skipping past a dropped segment.
+    pub gap_recoveries: u64,
+    /// Packets the capture backend lost under load (Windows packet capture).
+    pub capture_drops: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -191,6 +195,7 @@ fn capture_loop(
     let mut last_cleanup = Instant::now();
     let mut client_randoms = VecDeque::new();
     let mut embark_ips = HashSet::new();
+    let mut watchdog = CaptureWatchdog::new();
 
     while !stop.load(Ordering::Relaxed) {
         if let Some(packet) = capture.next_packet()? {
@@ -271,19 +276,95 @@ fn capture_loop(
                     }
                 }
             }
+            // Skip past any segment we dropped that has stalled a stream for two
+            // cleanup cycles (~10 s) - long enough to rule out mere reordering.
+            let recovered = manager.recover_stuck_gaps(2);
+            if !recovered.is_empty() {
+                let hosts = api_connections.lock().expect("discovery hosts poisoned");
+                for (connection_id, _direction, skipped) in &recovered {
+                    stats.gap_recoveries = stats.gap_recoveries.saturating_add(1);
+                    if let Some(host) = hosts.get(connection_id) {
+                        tx.try_send(CaptureEvent::Status(format!(
+                            "Recovered a dropped packet on the connection to {host} ({skipped} \
+                             bytes skipped); a statistics update may have been missed"
+                        )))
+                        .ok();
+                    }
+                }
+            }
+
             last_cleanup = Instant::now();
         }
 
         if last_stats.elapsed() >= Duration::from_secs(1) {
             stats.oversized_packets = capture.oversized_packets();
+            stats.capture_drops = capture.dropped_packets();
             stats.active_connections = manager.connections().count();
             stats.buffered_bytes = manager.total_memory();
+            watchdog.evaluate(&stats, tx);
             tx.try_send(CaptureEvent::Stats(Box::new(stats.clone())))
                 .ok();
             last_stats = Instant::now();
         }
     }
     Ok(())
+}
+
+/// Watches the capture counters and, once past a grace period, says out loud
+/// why nothing is being decrypted - so a mis-set backend, a wrong interface or a
+/// game that was launched first stops failing silently. Each distinct problem is
+/// reported at most once.
+struct CaptureWatchdog {
+    started: Instant,
+    warned_no_inbound: bool,
+    warned_no_handshake: bool,
+}
+
+impl CaptureWatchdog {
+    const GRACE: Duration = Duration::from_secs(60);
+
+    fn new() -> Self {
+        Self {
+            started: Instant::now(),
+            warned_no_inbound: false,
+            warned_no_handshake: false,
+        }
+    }
+
+    fn evaluate(&mut self, stats: &CaptureStats, tx: &Sender<CaptureEvent>) {
+        if self.started.elapsed() < Self::GRACE {
+            return;
+        }
+        // Packets are flowing but not one inbound HTTPS segment has arrived: the
+        // backend is almost certainly bound to the wrong interface (a VPN or a
+        // virtual adapter), so the game's traffic is never seen.
+        if stats.packets_seen > 0 && stats.tcp_443_to_client == 0 {
+            if !self.warned_no_inbound {
+                self.warned_no_inbound = true;
+                tx.try_send(CaptureEvent::Status(
+                    "Packets are flowing but no inbound HTTPS from the game has been seen; \
+                     capture may be on the wrong network interface or backend"
+                        .to_owned(),
+                ))
+                .ok();
+            }
+            return;
+        }
+        // The game's HTTPS is visible but no ClientHello was ever captured: the
+        // game was already running before ARC Live, so the keys for its
+        // long-lived API connection can never be matched until a fresh
+        // handshake. Restarting the game records one.
+        if stats.tcp_443_to_client > 0 && stats.tls_client_hellos == 0 && !self.warned_no_handshake
+        {
+            self.warned_no_handshake = true;
+            tx.try_send(CaptureEvent::Status(
+                "The game's connection was already open before ARC Live started, so its keys \
+                 could not be captured; restart the game to record a fresh handshake"
+                    .to_owned(),
+            ))
+            .ok();
+        }
+    }
 }
 
 /// Returns the manager together with the map of connections that talk to the
@@ -742,9 +823,13 @@ impl StreamParser for DiscoveryParser {
                     .expect("pending requests poisoned")
                     .remove(&context.connection_id);
             }
-            let is_player_stats = path_is_player_stats || body_is_player_stats;
+            // Emit the response only when the body actually carries stats rows.
+            // A matched request path is not enough: a 200 whose first scope is
+            // present but empty would otherwise be forwarded, normalise to all
+            // zeroes and wipe the stream counters. `body_is_player_stats` already
+            // requires non-empty rows, so it alone gates the emit.
             if status.is_some_and(|value| (200..300).contains(&value))
-                && is_player_stats
+                && body_is_player_stats
                 && let Some(stats) = decoded_json.as_ref()
             {
                 let serialized = stats.to_string();
@@ -1194,6 +1279,53 @@ mod tests {
     }
 
     #[test]
+    fn an_empty_scope_is_not_emitted_even_when_the_path_matches() {
+        // The request pairs the response to the stats path, but the body's first
+        // scope is present with zero rows. Emitting it would normalise to zeroes
+        // and wipe the stream counters, so nothing must be forwarded.
+        let parser = DiscoveryParser::default();
+        let request_context = StreamContext {
+            connection_id: 71,
+            direction: Direction::ToServer,
+            src_ip: "127.0.0.1".parse().unwrap(),
+            dst_ip: "127.0.0.2".parse().unwrap(),
+            src_port: 50_000,
+            dst_port: 443,
+            bytes_parsed: 0,
+            messages_parsed: 0,
+            alpn: None,
+        };
+        let request = b"POST /v1/pioneer/stats/player-v2 HTTP/1.1\r\nHost: api-gateway.asia.es-pio.net\r\nContent-Length: 2\r\n\r\n{}";
+        parser.parse_stream(request, &request_context);
+
+        let response_context = StreamContext {
+            direction: Direction::ToClient,
+            src_ip: request_context.dst_ip,
+            dst_ip: request_context.src_ip,
+            src_port: request_context.dst_port,
+            dst_port: request_context.src_port,
+            ..request_context
+        };
+        let body = br#"{"scopedPlayerStats":[{"playerStats":[]}]}"#;
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+            body.len(),
+            std::str::from_utf8(body).unwrap()
+        );
+        let StreamParseResult::Complete { messages, .. } =
+            parser.parse_stream(response.as_bytes(), &response_context)
+        else {
+            panic!("response was not parsed");
+        };
+        assert!(
+            messages.iter().all(|message| {
+                string_field(message, "kind").as_deref() != Some("player_stats_response")
+            }),
+            "an empty-scope response must not be forwarded as stats"
+        );
+    }
+
+    #[test]
     fn reads_a_statistics_response_larger_than_the_scan_buffer() {
         // The response grows with the account's history. Anything past the scan
         // buffer used to be trimmed away mid-message and never parsed at all.
@@ -1525,5 +1657,41 @@ mod tests {
             hosts.contains_key(&(MAX_TRACKED_API_CONNECTIONS as u64 * 2)),
             "the newest API connection must always be tracked"
         );
+    }
+
+    #[test]
+    fn watchdog_reports_wrong_interface_then_launch_order_once_each() {
+        let (tx, rx) = bounded(8);
+        let mut watchdog = CaptureWatchdog::new();
+        // Pretend the grace period has already elapsed.
+        watchdog.started = Instant::now() - CaptureWatchdog::GRACE - Duration::from_secs(1);
+
+        // Packets flow but nothing inbound on 443: wrong interface or backend.
+        let mut stats = CaptureStats {
+            packets_seen: 500,
+            ..Default::default()
+        };
+        watchdog.evaluate(&stats, &tx);
+        match rx.try_recv() {
+            Ok(CaptureEvent::Status(message)) => {
+                assert!(message.contains("wrong network interface"))
+            }
+            other => panic!("expected a wrong-interface warning, got {other:?}"),
+        }
+        // It does not repeat while the condition holds.
+        watchdog.evaluate(&stats, &tx);
+        assert!(rx.try_recv().is_err());
+
+        // Inbound HTTPS appears but no ClientHello was ever captured: launch order.
+        stats.tcp_443_to_client = 10;
+        watchdog.evaluate(&stats, &tx);
+        match rx.try_recv() {
+            Ok(CaptureEvent::Status(message)) => {
+                assert!(message.contains("already open before ARC Live"))
+            }
+            other => panic!("expected a launch-order warning, got {other:?}"),
+        }
+        watchdog.evaluate(&stats, &tx);
+        assert!(rx.try_recv().is_err());
     }
 }

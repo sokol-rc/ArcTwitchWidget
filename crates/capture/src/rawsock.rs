@@ -13,16 +13,22 @@
 #[cfg(windows)]
 mod platform {
     use std::net::Ipv4Addr;
-    use std::ptr::{null, null_mut};
+    use std::ptr::null_mut;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Arc, Mutex, OnceLock};
+    use std::time::{Duration, Instant};
 
     use anyhow::{Result, bail};
+    use windows_sys::Win32::Foundation::{ERROR_BUFFER_OVERFLOW, ERROR_SUCCESS};
+    use windows_sys::Win32::NetworkManagement::IpHelper::{
+        GAA_FLAG_SKIP_ANYCAST, GAA_FLAG_SKIP_DNS_SERVER, GAA_FLAG_SKIP_MULTICAST,
+        GetAdaptersAddresses, IP_ADAPTER_ADDRESSES_LH,
+    };
     use windows_sys::Win32::Networking::WinSock::{
-        ADDRESS_FAMILY, ADDRINFOA, AF_INET, FIONBIO, IN_ADDR, IN_ADDR_0, INVALID_SOCKET,
+        ADDRESS_FAMILY, AF_INET, AF_UNSPEC, FIONBIO, IN_ADDR, IN_ADDR_0, INVALID_SOCKET,
         IPPROTO_IP, SO_RCVBUF, SOCK_RAW, SOCKADDR, SOCKADDR_IN, SOCKET, SOCKET_ERROR, SOL_SOCKET,
         WSADATA, WSAEMSGSIZE, WSAEWOULDBLOCK, WSAGetLastError, WSAIoctl, WSAStartup, bind,
-        closesocket, freeaddrinfo, getaddrinfo, gethostname, ioctlsocket, recv, setsockopt, socket,
+        closesocket, ioctlsocket, recv, setsockopt, socket,
     };
 
     /// `_WSAIOW(IOC_VENDOR, 1)`.
@@ -37,6 +43,11 @@ mod platform {
     const BUFFER_SIZE: usize = 256 * 1024;
     const RECEIVE_BUFFER_BYTES: i32 = 16 * 1024 * 1024;
     const MAX_INTERFACES: usize = 8;
+    /// `IfOperStatusUp` from `IF_OPER_STATUS`.
+    const IF_OPER_STATUS_UP: i32 = 1;
+    /// How often the bound interface set is re-checked so a VPN or virtual
+    /// adapter that appears (or disappears) mid-session is picked up.
+    const REBIND_INTERVAL: Duration = Duration::from_secs(15);
 
     fn ensure_winsock() -> Result<()> {
         static STARTED: OnceLock<i32> = OnceLock::new();
@@ -50,44 +61,72 @@ mod platform {
         Ok(())
     }
 
-    /// Local IPv4 addresses worth listening on. Loopback and link-local carry no
-    /// game traffic, so they are skipped.
+    /// Local IPv4 addresses worth listening on, enumerated over *every* adapter.
+    ///
+    /// The earlier `gethostname` + `getaddrinfo` approach only returned the
+    /// primary NIC and silently missed VPN/tun and Hyper-V `vEthernet` adapters,
+    /// so game traffic egressing there was never captured. `GetAdaptersAddresses`
+    /// walks all operational adapters, which also lets a VPN that connects
+    /// mid-session be picked up on the next rebind. Loopback and link-local carry
+    /// no game traffic and are skipped.
     fn local_ipv4_addresses() -> Result<Vec<Ipv4Addr>> {
         ensure_winsock()?;
-        let mut name = [0u8; 256];
-        if unsafe { gethostname(name.as_mut_ptr(), name.len() as i32) } == SOCKET_ERROR {
-            bail!("gethostname failed with error {}", unsafe {
-                WSAGetLastError()
-            });
+        let flags = GAA_FLAG_SKIP_ANYCAST | GAA_FLAG_SKIP_MULTICAST | GAA_FLAG_SKIP_DNS_SERVER;
+        let mut size: u32 = 15 * 1024;
+        let mut buffer = vec![0u8; size as usize];
+        let mut ready = false;
+        for _ in 0..4 {
+            let status = unsafe {
+                GetAdaptersAddresses(
+                    AF_UNSPEC as u32,
+                    flags,
+                    null_mut(),
+                    buffer.as_mut_ptr().cast::<IP_ADAPTER_ADDRESSES_LH>(),
+                    &mut size,
+                )
+            };
+            if status == ERROR_SUCCESS {
+                ready = true;
+                break;
+            }
+            if status == ERROR_BUFFER_OVERFLOW {
+                buffer.resize(size as usize, 0);
+                continue;
+            }
+            bail!("GetAdaptersAddresses failed with error {status}");
         }
-        let hints = ADDRINFOA {
-            ai_family: AF_INET as i32,
-            ..Default::default()
-        };
-        let mut result: *mut ADDRINFOA = null_mut();
-        let code = unsafe { getaddrinfo(name.as_ptr(), null(), &hints, &mut result) };
-        if code != 0 {
-            bail!("resolving local interfaces failed with error {code}");
+        if !ready {
+            bail!("GetAdaptersAddresses did not settle on a buffer size");
         }
+
         let mut addresses = Vec::new();
-        let mut cursor = result;
-        while !cursor.is_null() {
-            let entry = unsafe { &*cursor };
-            if entry.ai_family == AF_INET as i32 && !entry.ai_addr.is_null() {
-                let sockaddr = entry.ai_addr.cast::<SOCKADDR_IN>();
-                let raw = unsafe { (*sockaddr).sin_addr.S_un.S_addr };
-                let address = Ipv4Addr::from(u32::from_be(raw));
-                if !address.is_loopback()
-                    && !address.is_link_local()
-                    && !address.is_unspecified()
-                    && !addresses.contains(&address)
-                {
-                    addresses.push(address);
+        let mut adapter = buffer.as_ptr().cast::<IP_ADAPTER_ADDRESSES_LH>();
+        while !adapter.is_null() {
+            let entry = unsafe { &*adapter };
+            if entry.OperStatus == IF_OPER_STATUS_UP {
+                let mut unicast = entry.FirstUnicastAddress;
+                while !unicast.is_null() {
+                    let address = unsafe { &*unicast };
+                    let sockaddr = address.Address.lpSockaddr;
+                    if !sockaddr.is_null()
+                        && unsafe { (*sockaddr).sa_family } == AF_INET as ADDRESS_FAMILY
+                    {
+                        let sin = sockaddr.cast::<SOCKADDR_IN>();
+                        let raw = unsafe { (*sin).sin_addr.S_un.S_addr };
+                        let ip = Ipv4Addr::from(u32::from_be(raw));
+                        if !ip.is_loopback()
+                            && !ip.is_link_local()
+                            && !ip.is_unspecified()
+                            && !addresses.contains(&ip)
+                        {
+                            addresses.push(ip);
+                        }
+                    }
+                    unicast = address.Next;
                 }
             }
-            cursor = entry.ai_next;
+            adapter = entry.Next;
         }
-        unsafe { freeaddrinfo(result) };
         addresses.truncate(MAX_INTERFACES);
         if addresses.is_empty() {
             bail!("no usable IPv4 interface was found for raw-socket capture");
@@ -170,17 +209,22 @@ mod platform {
         Ok(handle)
     }
 
+    /// A capture socket together with the interface address it is bound to, so
+    /// disappeared adapters can be closed and new ones opened without disturbing
+    /// the rest.
+    type BoundSocket = (Ipv4Addr, SOCKET);
+
     #[derive(Clone)]
     pub struct RawCaptureControl {
         stop: Arc<AtomicBool>,
-        sockets: Arc<Mutex<Vec<SOCKET>>>,
+        sockets: Arc<Mutex<Vec<BoundSocket>>>,
     }
 
     impl RawCaptureControl {
         pub fn shutdown(&self) {
             self.stop.store(true, Ordering::Relaxed);
             if let Ok(mut sockets) = self.sockets.lock() {
-                for handle in sockets.drain(..) {
+                for (_, handle) in sockets.drain(..) {
                     unsafe { closesocket(handle) };
                 }
             }
@@ -189,9 +233,10 @@ mod platform {
 
     pub struct RawCapture {
         stop: Arc<AtomicBool>,
-        sockets: Arc<Mutex<Vec<SOCKET>>>,
+        sockets: Arc<Mutex<Vec<BoundSocket>>>,
         next: usize,
         buffer: Vec<u8>,
+        last_rebind: Instant,
         pub oversized_packets: u64,
     }
 
@@ -202,7 +247,7 @@ mod platform {
             let mut last_error = None;
             for address in addresses {
                 match open_socket(address) {
-                    Ok(handle) => handles.push(handle),
+                    Ok(handle) => handles.push((address, handle)),
                     Err(error) => last_error = Some(error),
                 }
             }
@@ -223,10 +268,45 @@ mod platform {
                     sockets,
                     next: 0,
                     buffer: vec![0; BUFFER_SIZE],
+                    last_rebind: Instant::now(),
                     oversized_packets: 0,
                 },
                 control,
             ))
+        }
+
+        /// Periodically reconcile the bound sockets with the current adapter set:
+        /// close sockets whose interface vanished (a VPN dropped) and open one for
+        /// each interface that appeared (a VPN connected). Without this the socket
+        /// set was frozen at startup and game traffic that later moved onto a new
+        /// adapter went uncaptured with no signal.
+        fn maybe_rebind(&mut self) {
+            if self.last_rebind.elapsed() < REBIND_INTERVAL {
+                return;
+            }
+            self.last_rebind = Instant::now();
+            let Ok(current) = local_ipv4_addresses() else {
+                return;
+            };
+            let Ok(mut sockets) = self.sockets.lock() else {
+                return;
+            };
+            let mut index = 0;
+            while index < sockets.len() {
+                if current.contains(&sockets[index].0) {
+                    index += 1;
+                } else {
+                    let (_, handle) = sockets.remove(index);
+                    unsafe { closesocket(handle) };
+                }
+            }
+            for address in current {
+                if !sockets.iter().any(|(bound, _)| *bound == address)
+                    && let Ok(handle) = open_socket(address)
+                {
+                    sockets.push((address, handle));
+                }
+            }
         }
 
         /// Polls every interface once. Returns `None` when nothing is pending,
@@ -235,8 +315,9 @@ mod platform {
             if self.stop.load(Ordering::Relaxed) {
                 return Ok(None);
             }
+            self.maybe_rebind();
             let handles: Vec<SOCKET> = match self.sockets.lock() {
-                Ok(sockets) => sockets.clone(),
+                Ok(sockets) => sockets.iter().map(|(_, handle)| *handle).collect(),
                 Err(_) => return Ok(None),
             };
             if handles.is_empty() {
@@ -281,7 +362,7 @@ mod platform {
     impl Drop for RawCapture {
         fn drop(&mut self) {
             if let Ok(mut sockets) = self.sockets.lock() {
-                for handle in sockets.drain(..) {
+                for (_, handle) in sockets.drain(..) {
                     unsafe { closesocket(handle) };
                 }
             }

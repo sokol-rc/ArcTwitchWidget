@@ -21,10 +21,10 @@ mod platform {
     use windows_sys::Win32::Foundation::{ERROR_ALREADY_EXISTS, ERROR_SUCCESS};
     use windows_sys::Win32::System::Diagnostics::Etw::{
         CONTROLTRACE_HANDLE, CloseTrace, ControlTraceW, EVENT_CONTROL_CODE_ENABLE_PROVIDER,
-        EVENT_RECORD, EVENT_TRACE_CONTROL_STOP, EVENT_TRACE_LOGFILEW, EVENT_TRACE_PROPERTIES,
-        EVENT_TRACE_REAL_TIME_MODE, EnableTraceEx2, OpenTraceW, PROCESS_TRACE_MODE_EVENT_RECORD,
-        PROCESS_TRACE_MODE_REAL_TIME, PROCESSTRACE_HANDLE, ProcessTrace, StartTraceW,
-        WNODE_FLAG_TRACED_GUID,
+        EVENT_RECORD, EVENT_TRACE_CONTROL_QUERY, EVENT_TRACE_CONTROL_STOP, EVENT_TRACE_LOGFILEW,
+        EVENT_TRACE_PROPERTIES, EVENT_TRACE_REAL_TIME_MODE, EnableTraceEx2, OpenTraceW,
+        PROCESS_TRACE_MODE_EVENT_RECORD, PROCESS_TRACE_MODE_REAL_TIME, PROCESSTRACE_HANDLE,
+        ProcessTrace, StartTraceW, WNODE_FLAG_TRACED_GUID,
     };
     use windows_sys::core::GUID;
 
@@ -45,9 +45,36 @@ mod platform {
     const ETHERTYPE_VLAN: u16 = 0x8100;
     const QUEUE_CAPACITY: usize = 8192;
     const TRACE_LEVEL_VERBOSE: u8 = 5;
+    const IP_PROTOCOL_TCP: u8 = 6;
+    const TLS_PORT: u16 = 443;
 
     fn wide(value: &str) -> Vec<u16> {
         value.encode_utf16().chain(std::iter::once(0)).collect()
+    }
+
+    /// The NDIS provider hands us every frame on every interface. Only TCP/443
+    /// can carry the game's TLS, so everything else is dropped before it ever
+    /// reaches the bounded queue - that filter is what keeps a busy streaming
+    /// machine from overrunning the channel and losing a ServerHello or a piece
+    /// of the stats response. Cheap header math only, no allocation.
+    fn is_tls_traffic(ipv4: &[u8]) -> bool {
+        if ipv4.len() < 20 || ipv4[0] >> 4 != 4 {
+            return false;
+        }
+        let ihl = (ipv4[0] & 0x0f) as usize * 4;
+        if ihl < 20 || ipv4.len() < ihl + 4 || ipv4[9] != IP_PROTOCOL_TCP {
+            return false;
+        }
+        let src_port = u16::from_be_bytes([ipv4[ihl], ipv4[ihl + 1]]);
+        let dst_port = u16::from_be_bytes([ipv4[ihl + 2], ipv4[ihl + 3]]);
+        src_port == TLS_PORT || dst_port == TLS_PORT
+    }
+
+    /// Passed to the ETW callback by pointer: where to push captured packets and
+    /// where to record the ones dropped when that queue is full.
+    struct CallbackContext {
+        sender: Sender<Vec<u8>>,
+        dropped: Arc<AtomicU64>,
     }
 
     /// `EVENT_TRACE_PROPERTIES` has to be followed by the session name in the
@@ -161,10 +188,16 @@ mod platform {
         let Some(packet) = ipv4_payload(frame) else {
             return;
         };
-        let sender = unsafe { &*record.UserContext.cast::<Sender<Vec<u8>>>() };
+        if !is_tls_traffic(packet) {
+            return;
+        }
+        let context = unsafe { &*record.UserContext.cast::<CallbackContext>() };
         // Dropping under pressure is better than blocking the ETW callback,
-        // which would stall the whole session.
-        let _ = sender.try_send(packet.to_vec());
+        // which would stall the whole session - but the drop is counted so a
+        // saturated queue is visible instead of silently losing packets.
+        if context.sender.try_send(packet.to_vec()).is_err() {
+            context.dropped.fetch_add(1, Ordering::Relaxed);
+        }
     }
 
     /// Strips the Ethernet (and optional VLAN) header so the rest of the crate
@@ -193,9 +226,43 @@ mod platform {
         stop: Arc<AtomicBool>,
         session: Arc<Mutex<CONTROLTRACE_HANDLE>>,
         trace: Arc<AtomicU64>,
+        dropped: Arc<AtomicU64>,
     }
 
     impl RawCaptureControl {
+        /// Packets lost: the ones we dropped from a full queue plus the ones ETW
+        /// itself reported losing in its real-time buffers. Either kind means a
+        /// piece of a TLS stream may be missing.
+        pub fn dropped_packets(&self) -> u64 {
+            self.dropped
+                .load(Ordering::Relaxed)
+                .saturating_add(self.session_lost())
+        }
+
+        /// Ask the running trace how many events and real-time buffers it has
+        /// lost since it started. Zero if the query fails.
+        fn session_lost(&self) -> u64 {
+            let Ok(session) = self.session.lock() else {
+                return 0;
+            };
+            let mut properties = SessionProperties::new(SESSION_NAME);
+            let status = unsafe {
+                ControlTraceW(
+                    *session,
+                    std::ptr::null(),
+                    properties.as_mut_ptr(),
+                    EVENT_TRACE_CONTROL_QUERY,
+                )
+            };
+            if status != ERROR_SUCCESS {
+                return 0;
+            }
+            unsafe {
+                let props = &*properties.as_mut_ptr();
+                u64::from(props.EventsLost).saturating_add(u64::from(props.RealTimeBuffersLost))
+            }
+        }
+
         pub fn shutdown(&self) {
             if self.stop.swap(true, Ordering::SeqCst) {
                 return;
@@ -233,30 +300,35 @@ mod platform {
                 stop: Arc::new(AtomicBool::new(false)),
                 session: Arc::new(Mutex::new(session)),
                 trace: Arc::new(AtomicU64::new(0)),
+                dropped: Arc::new(AtomicU64::new(0)),
             };
             let trace_slot = Arc::clone(&control.trace);
+            let dropped = Arc::clone(&control.dropped);
             let worker = thread::spawn(move || {
-                // The sender outlives ProcessTrace: the callback dereferences
+                // The context outlives ProcessTrace: the callback dereferences
                 // this pointer for every event.
-                let sender = Box::into_raw(Box::new(tx));
+                let context = Box::into_raw(Box::new(CallbackContext {
+                    sender: tx,
+                    dropped,
+                }));
                 let name = wide(SESSION_NAME);
                 let mut logfile: EVENT_TRACE_LOGFILEW = unsafe { std::mem::zeroed() };
                 logfile.LoggerName = name.as_ptr().cast_mut();
                 logfile.Anonymous1.ProcessTraceMode =
                     PROCESS_TRACE_MODE_REAL_TIME | PROCESS_TRACE_MODE_EVENT_RECORD;
                 logfile.Anonymous2.EventRecordCallback = Some(on_event);
-                logfile.Context = sender.cast();
+                logfile.Context = context.cast();
                 let trace = unsafe { OpenTraceW(&mut logfile) };
                 // INVALID_PROCESSTRACE_HANDLE is all-ones on 64-bit Windows.
                 if trace.Value == u64::MAX {
-                    unsafe { drop(Box::from_raw(sender)) };
+                    unsafe { drop(Box::from_raw(context)) };
                     return;
                 }
                 trace_slot.store(trace.Value, Ordering::SeqCst);
                 unsafe {
                     ProcessTrace(&trace, 1, std::ptr::null(), std::ptr::null());
                     CloseTrace(trace);
-                    drop(Box::from_raw(sender));
+                    drop(Box::from_raw(context));
                 }
             });
             Ok((
@@ -278,6 +350,11 @@ mod platform {
                 }
                 Err(_) => Ok(None),
             }
+        }
+
+        /// Packets lost since capture began (full queue plus ETW buffer loss).
+        pub fn dropped_packets(&self) -> u64 {
+            self.control.dropped_packets()
         }
     }
 
@@ -319,6 +396,28 @@ mod platform {
             assert!(ipv4_payload(&arp).is_none());
             assert!(ipv4_payload(&[0u8; 4]).is_none());
         }
+
+        fn ipv4_tcp(src_port: u16, dst_port: u16) -> Vec<u8> {
+            let mut packet = vec![0u8; 24];
+            packet[0] = 0x45; // IPv4, 20-byte header
+            packet[9] = IP_PROTOCOL_TCP;
+            packet[20..22].copy_from_slice(&src_port.to_be_bytes());
+            packet[22..24].copy_from_slice(&dst_port.to_be_bytes());
+            packet
+        }
+
+        #[test]
+        fn keeps_only_tls_port_traffic() {
+            assert!(is_tls_traffic(&ipv4_tcp(52345, 443)));
+            assert!(is_tls_traffic(&ipv4_tcp(443, 52345)));
+            assert!(!is_tls_traffic(&ipv4_tcp(52345, 80)));
+            // A UDP packet on 443 (QUIC) is not TCP and must be ignored.
+            let mut udp = ipv4_tcp(443, 443);
+            udp[9] = 17;
+            assert!(!is_tls_traffic(&udp));
+            // Too short to hold a TCP port pair.
+            assert!(!is_tls_traffic(&[0x45, 0, 0, 0]));
+        }
     }
 }
 
@@ -345,5 +444,9 @@ impl RawCapture {
 
     pub fn next_packet(&mut self) -> anyhow::Result<Option<&[u8]>> {
         Ok(None)
+    }
+
+    pub fn dropped_packets(&self) -> u64 {
+        0
     }
 }

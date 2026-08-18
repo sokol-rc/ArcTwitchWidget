@@ -209,6 +209,15 @@ impl PacketSource {
             Self::Etw(_) | Self::WinDivert(_) => 0,
         }
     }
+
+    /// Packets the capture layer lost under load. Only the Windows packet-capture
+    /// backend accounts for this today; the others report zero.
+    pub fn dropped_packets(&self) -> u64 {
+        match self {
+            Self::Etw(capture) => capture.dropped_packets(),
+            Self::RawSocket(_) | Self::WinDivert(_) => 0,
+        }
+    }
 }
 
 #[cfg(test)]

@@ -12,7 +12,7 @@ members = [
 resolver = "2"
 
 [workspace.package]
-version = "0.20.0"
+version = "0.21.0"
 edition = "2024"
 license = "PolyForm-Noncommercial-1.0.0"
 
@@ -51,6 +51,8 @@ windows-sys = { version = "0.61.2", features = [
   "Win32_System_Diagnostics_Etw",
   "Win32_System_Time",
   "Win32_Networking_WinSock",
+  "Win32_NetworkManagement_IpHelper",
+  "Win32_NetworkManagement_Ndis",
   "Win32_System_IO",
   "Win32_System_Diagnostics_ToolHelp",
   "Win32_System_Threading",

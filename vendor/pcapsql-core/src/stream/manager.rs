@@ -247,7 +247,7 @@ impl StreamManager {
                     bytes_consumed,
                     metadata,
                 } => {
-                    if let Some(mut meta) = metadata {
+                    for mut meta in metadata {
                         meta.frame_number = frame_number;
                         messages.push(meta);
                     }
@@ -399,6 +399,19 @@ impl StreamManager {
         }
 
         removed
+    }
+
+    /// Skip past gaps on streams that have stayed blocked behind a missing
+    /// segment for at least `threshold` maintenance ticks. Passive capture never
+    /// sees the retransmit of a packet it dropped, so without this a single lost
+    /// segment stalls a connection until it is torn down. Returns one entry per
+    /// recovered stream so the caller can note a possibly-missed message.
+    pub fn recover_stuck_gaps(&mut self, threshold: u8) -> Vec<(u64, Direction, u64)> {
+        let recovered = self.reassembler.recover_stuck_gaps(threshold);
+        if !recovered.is_empty() {
+            self.total_memory = self.reassembler.buffered_bytes();
+        }
+        recovered
     }
 
     /// Get all tracked connections.

@@ -15,7 +15,7 @@ use crossbeam_channel::{Receiver, Sender, bounded};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-pub const SERVICE_PROTOCOL_VERSION: u8 = 3;
+pub const SERVICE_PROTOCOL_VERSION: u8 = 4;
 pub const DEFAULT_SERVICE_ADDRESS: &str = "127.0.0.1:17843";
 
 pub fn service_address_file() -> Option<PathBuf> {
@@ -89,7 +89,10 @@ impl Drop for CollectorHandle {
 }
 
 pub fn start_local(keylog_path: PathBuf, privileged_service: bool) -> CollectorHandle {
-    let (tx, events) = bounded(256);
+    // Roomy on purpose: 1 Hz `Stats` and a lobby burst of `Observation`s share
+    // this channel with the rare, critical `Probe`, and a small bound let a
+    // backlog of the former crowd out the latter.
+    let (tx, events) = bounded(1024);
     let stop = Arc::new(AtomicBool::new(false));
     let worker_stop = Arc::clone(&stop);
     let worker = thread::spawn(move || {
@@ -148,7 +151,14 @@ fn run_collector(
                 }
                 match native_stats_payload(host, status, content_type, body) {
                     Ok(payload) => {
-                        tx.try_send(CollectorEvent::Probe(Box::new(payload))).ok();
+                        // The stats response is the entire point of the app, and
+                        // it arrives at most once per raid. Never drop it because
+                        // a backlog of 1 Hz Stats filled the channel: block until
+                        // the consumer takes it (it drains within a UI frame; a
+                        // disconnected consumer ends the loop instead).
+                        if tx.send(CollectorEvent::Probe(Box::new(payload))).is_err() {
+                            break;
+                        }
                     }
                     Err(error) => {
                         tx.try_send(CollectorEvent::Error(format!(

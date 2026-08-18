@@ -237,6 +237,11 @@ impl ArcLiveApp {
                 "A new local day started; stream baseline will be refreshed",
             );
         }
+        // Push the zeroed counters to OBS right away. During a quiet AFK a
+        // midnight rollover changes nothing else, so without this the widget kept
+        // showing yesterday's session numbers until the next stats response.
+        let snapshot = self.state.read().expect("state poisoned").clone();
+        self.server.notify(&snapshot);
         self.record_user_event(
             "info",
             "Начался новый день — счётчики стрима продолжат работу после синхронизации",

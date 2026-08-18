@@ -51,7 +51,9 @@ pub enum StreamParseResult {
         child_protocol: &'static str,
         child_data: Vec<u8>,
         bytes_consumed: usize,
-        metadata: Option<ParsedMessage>,
+        /// Every per-record TLS message produced by this parse, forwarded so
+        /// their telemetry fields are counted, not just the first record's.
+        metadata: Vec<ParsedMessage>,
     },
 
     /// Need more data before parsing can proceed.

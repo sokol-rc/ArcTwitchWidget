@@ -90,7 +90,15 @@ mod windows {
         let handle = Handle(handle);
         let mut wow64 = 0i32;
         if unsafe { IsWow64Process(handle.0, &mut wow64) } == 0 || wow64 != 0 {
-            return Ok(None);
+            // A 32-bit launcher (EpicGamesLauncher.exe) has a WOW64 PEB whose
+            // layout differs from the x64 offsets below, so its environment
+            // cannot be read this way. This is "unreadable", NOT "the variable is
+            // absent": returning Ok(None) here made the probe report the key log
+            // as missing for Epic even when it was set. Surface it as an error so
+            // the caller stays silent and installs the variable via setx instead.
+            return Err(anyhow!(
+                "cannot read a 32-bit launcher's environment from a 64-bit process"
+            ));
         }
 
         let mut info: ProcessBasicInformation = unsafe { zeroed() };
